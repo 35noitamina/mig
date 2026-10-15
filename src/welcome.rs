@@ -169,6 +169,7 @@ impl Welcome {
         );
         if ui
           .add(egui::Button::new("Browse…").min_size(egui::vec2(80.0, 30.0)))
+          .on_hover_text("Pick a folder")
           .clicked()
           && let Some(p) = rfd::FileDialog::new().set_directory(self.dir()).pick_folder()
         {
@@ -179,7 +180,11 @@ impl Welcome {
     card(ui, "Open", |ui| {
       ui.label(RichText::new("Open the repository in the folder above.").weak());
       ui.add_space(6.0);
-      if ui.add(primary("Open repository")).clicked() {
+      if ui
+        .add(primary("Open repository"))
+        .on_hover_text("Open the repository in this folder")
+        .clicked()
+      {
         match repo::open(&self.dir()) {
           Ok(r) => {
             opened = Some(Opened {
@@ -197,7 +202,11 @@ impl Welcome {
     card(ui, "Make it a repository", |ui| {
       ui.label(RichText::new("Turn the existing folder above into a repository, keeping its files.").weak());
       ui.add_space(6.0);
-      if ui.add(secondary("Set up this folder…")).clicked() {
+      if ui
+        .add(secondary("Set up this folder…"))
+        .on_hover_text("Review the files and options before creating the repository")
+        .clicked()
+      {
         let d = self.dir();
         if d.is_dir() {
           self.error = None;
@@ -219,6 +228,8 @@ impl Welcome {
         );
         if ui
           .add_enabled(!self.name.trim().is_empty(), secondary("Create…"))
+          .on_hover_text("Create a new folder with this name and set it up")
+          .on_disabled_hover_text("Type a name first")
           .clicked()
         {
           let d = self.dir().join(self.name.trim());
@@ -250,7 +261,11 @@ impl Welcome {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
           ui.horizontal(|ui| {
-            if ui.link(RichText::new(name).size(15.0)).clicked() {
+            if ui
+              .link(RichText::new(name).size(15.0))
+              .on_hover_text("Open this repository")
+              .clicked()
+            {
               opened = Some(Opened {
                 dir: p.clone(),
                 status: String::new(),
@@ -263,7 +278,11 @@ impl Welcome {
       });
     }
     ui.vertical_centered(|ui| {
-      if ui.add(secondary("Settings…")).clicked() {
+      if ui
+        .add(secondary("Settings…"))
+        .on_hover_text("Appearance and commit identity")
+        .clicked()
+      {
         self.settings = Some(SettingsDialog::new(None));
       }
     });
@@ -287,6 +306,7 @@ impl Welcome {
           d.creating.is_none(),
           egui::Button::new("Back").min_size(egui::vec2(64.0, 28.0)),
         )
+        .on_hover_text("Back to the welcome screen")
         .clicked()
       {
         keep = false;
@@ -441,10 +461,18 @@ impl Welcome {
       } else {
         "Make repository"
       };
-      if ui.add_enabled(ok, primary(label)).clicked() {
+      if ui
+        .add_enabled(ok, primary(label))
+        .on_hover_text("Create the repository with these options")
+        .clicked()
+      {
         create = true;
       }
-      if ui.add_enabled(d.creating.is_none(), secondary("Cancel")).clicked() {
+      if ui
+        .add_enabled(d.creating.is_none(), secondary("Cancel"))
+        .on_hover_text("Back without creating anything")
+        .clicked()
+      {
         keep = false;
       }
       if d.creating.is_some() {

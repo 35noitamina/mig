@@ -287,7 +287,7 @@ impl SettingsDialog {
             let save = egui::Button::new(RichText::new("Save").strong().color(Color32::WHITE))
               .fill(Color32::from_rgb(45, 110, 200))
               .min_size(egui::vec2(100.0, 30.0));
-            if ui.add(save).clicked() {
+            if ui.add(save).on_hover_text("Save and apply").clicked() {
               match self.save(ctx) {
                 Ok(()) => outcome = Outcome::Saved,
                 Err(e) => self.error = Some(format!("{e:#}")),
@@ -295,6 +295,7 @@ impl SettingsDialog {
             }
             if ui
               .add(egui::Button::new("Cancel").min_size(egui::vec2(80.0, 30.0)))
+              .on_hover_text("Close without saving")
               .clicked()
             {
               outcome = Outcome::Closed;
@@ -441,7 +442,11 @@ impl SettingsDialog {
        after `gh auth login`. It is never stored by mig.",
     );
     ui.add_space(6.0);
-    if ui.button("Check again").clicked() {
+    if ui
+      .button("Check again")
+      .on_hover_text("Look for a token again")
+      .clicked()
+    {
       self.token_ok = github::token().is_some();
     }
   }

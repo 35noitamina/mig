@@ -180,6 +180,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | 画面 | できること |
 |---|---|
 | Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。Ctrl/Cmd+S で保存 |
+| ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられる |
 | History | 履歴と差分。複数選択して Fold、右クリックで Reword / Split / Fold / Drop |
 | ツールバー | Commit、Absorb、Sync、Undo、Redo、Repo メニュー（リポジトリの切り替え、GitHub への公開）、Settings |
 
@@ -193,6 +194,8 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | Node.js（`package.json`） | `npm run build --if-present` | `npm start` |
 | Go（`go.mod`） | `go build ./...` | `go run .` |
 | Python（`*.py`） | 全 `.py` の構文チェック | `python main.py` |
+
+ボタンにマウスを乗せると短い説明が出る。
 
 大きなフォルダでも画面が止まらないよう、状態の読み込み・コミット・作成は裏で行い、履歴 → 変更一覧 → 差分の順に表示する。
 

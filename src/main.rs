@@ -19,6 +19,8 @@ mod settings;
 mod setup;
 mod split;
 #[cfg(feature = "gui")]
+mod viewer;
+#[cfg(feature = "gui")]
 mod welcome;
 
 fn main() {

@@ -218,6 +218,7 @@ pub fn run(dir: PathBuf, open: Option<PathBuf>) -> Result<()> {
     Box::new(move |cc| {
       load_cjk_font(&cc.egui_ctx);
       Settings::load().apply(&cc.egui_ctx);
+      egui_extras::install_image_loaders(&cc.egui_ctx);
       let mut shell = Shell {
         app: None,
         welcome: Welcome::new(Some(dir), None).with_info(note),
@@ -686,13 +687,19 @@ impl App {
   fn toolbar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
       ui.menu_button("Repo", |ui| {
-        if ui.button("Open / new repository…").clicked() {
+        if ui
+          .button("Open / new repository…")
+          .on_hover_text("Go back to the welcome screen")
+          .clicked()
+        {
           self.leave = true;
           ui.close();
         }
         let has_origin = self.repo.find_remote("origin").is_ok();
         if ui
           .add_enabled(!has_origin, egui::Button::new("Publish to GitHub…"))
+          .on_hover_text("Create this repository on GitHub, add it as origin and push")
+          .on_disabled_hover_text("origin is already set")
           .clicked()
         {
           self.publish = Some(PublishDialog {
@@ -715,7 +722,11 @@ impl App {
           }
         }
       });
-      if ui.button("Settings").clicked() {
+      if ui
+        .button("Settings")
+        .on_hover_text("Appearance, commit identity and this repository's options")
+        .clicked()
+      {
         self.settings = Some(SettingsDialog::new(Some(&self.root)));
       }
       ui.separator();
@@ -735,6 +746,7 @@ impl App {
           self.saving.is_none() && (!self.changes.is_empty() || dirty),
           egui::Button::new("Commit"),
         )
+        .on_hover_text("Save open files and commit every change (mig save)")
         .clicked()
       {
         self.commit(false);
@@ -746,19 +758,35 @@ impl App {
       {
         self.absorb();
       }
-      if ui.button("Sync").clicked() {
+      if ui
+        .button("Sync")
+        .on_hover_text("Fetch, put your commits on top of the remote and push (mig sync)")
+        .clicked()
+      {
         self.sync(false);
       }
       ui.separator();
-      if ui.button("Undo").clicked() {
+      if ui
+        .button("Undo")
+        .on_hover_text("Undo the last operation (mig undo)")
+        .clicked()
+      {
         let r = oplog::undo(&self.repo, false).map(|op| format!("undid: {}", op.cmd));
         self.done(r);
       }
-      if ui.button("Redo").clicked() {
+      if ui
+        .button("Redo")
+        .on_hover_text("Redo what was undone (mig redo)")
+        .clicked()
+      {
         let r = oplog::redo(&self.repo, false).map(|op| format!("redid: {}", op.cmd));
         self.done(r);
       }
-      if ui.button("Refresh").clicked() {
+      if ui
+        .button("Refresh")
+        .on_hover_text("Reload the working tree and history")
+        .clicked()
+      {
         self.refresh();
       }
       if self.auto_lines > 0 {
@@ -825,7 +853,12 @@ impl App {
       } else {
         "Fold into parent".into()
       };
-      if ui.add_enabled(n >= 1, egui::Button::new(label)).clicked() {
+      if ui
+        .add_enabled(n >= 1, egui::Button::new(label))
+        .on_hover_text("Combine the selected commits (or one commit and its parent) into one")
+        .on_disabled_hover_text("Select commits in the list first")
+        .clicked()
+      {
         self.fold_selected();
       }
     });
@@ -846,13 +879,13 @@ impl App {
           clicked = Some(i);
         }
         resp.context_menu(|ui| {
-          for (name, key) in [
-            ("Reword…", "reword"),
-            ("Split…", "split"),
-            ("Fold into parent", "fold"),
-            ("Drop", "drop"),
+          for (name, key, tip) in [
+            ("Reword…", "reword", "Change this commit's message"),
+            ("Split…", "split", "Split this commit in two by file"),
+            ("Fold into parent", "fold", "Combine this commit with the one before it"),
+            ("Drop", "drop", "Remove this commit from history"),
           ] {
-            if ui.button(name).clicked() {
+            if ui.button(name).on_hover_text(tip).clicked() {
               action = Some((key, i));
               ui.close();
             }
@@ -924,11 +957,12 @@ impl App {
           );
         }
         ui.horizontal(|ui| {
-          if ui.button("Cancel").clicked() {
+          if ui.button("Cancel").on_hover_text("Close without publishing").clicked() {
             keep = false;
           }
           if ui
             .add_enabled(d.token_ok && !d.name.trim().is_empty(), egui::Button::new("Publish"))
+            .on_hover_text("Create the GitHub repository and push")
             .clicked()
           {
             go = true;
@@ -974,10 +1008,14 @@ impl App {
           ui.label(RichText::new(format!("{path}: {} (too large)", guard::fmt_size(*size))).monospace());
         }
         ui.horizontal(|ui| {
-          if ui.button("Cancel").clicked() {
+          if ui.button("Cancel").on_hover_text("Don't commit").clicked() {
             keep = false;
           }
-          if ui.button(RichText::new("Commit anyway").color(Color32::RED)).clicked() {
+          if ui
+            .button(RichText::new("Commit anyway").color(Color32::RED))
+            .on_hover_text("Commit even though problems were found")
+            .clicked()
+          {
             keep = false;
             force = true;
           }
@@ -996,10 +1034,14 @@ impl App {
         ui.label("Unpushed commits contain possible secrets. Remove them (e.g. Drop) before syncing.");
         findings_list(ui, &found);
         ui.horizontal(|ui| {
-          if ui.button("OK").clicked() {
+          if ui.button("OK").on_hover_text("Don't push").clicked() {
             keep = false;
           }
-          if ui.button(RichText::new("Push anyway").color(Color32::RED)).clicked() {
+          if ui
+            .button(RichText::new("Push anyway").color(Color32::RED))
+            .on_hover_text("Push even though possible secrets were found")
+            .clicked()
+          {
             keep = false;
             force = true;
           }
@@ -1019,10 +1061,10 @@ impl App {
         .show(ctx, |ui| {
           ui.add(egui::TextEdit::multiline(&mut msg).desired_rows(6).desired_width(420.0));
           ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
+            if ui.button("Cancel").on_hover_text("Keep the old message").clicked() {
               keep = false;
             }
-            if ui.button("Apply").clicked() {
+            if ui.button("Apply").on_hover_text("Save the new message").clicked() {
               apply = true;
             }
           });
@@ -1050,10 +1092,14 @@ impl App {
           });
           ui.add(egui::TextEdit::singleline(&mut d.message).hint_text("first commit message (optional)"));
           ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
+            if ui.button("Cancel").on_hover_text("Close without splitting").clicked() {
               keep = false;
             }
-            if ui.button("Split").clicked() {
+            if ui
+              .button("Split")
+              .on_hover_text("Split the commit with the checked files first")
+              .clicked()
+            {
               apply = true;
             }
           });
