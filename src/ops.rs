@@ -288,9 +288,19 @@ fn callbacks<'a>() -> RemoteCallbacks<'a> {
         }
       }
     }
-    if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) && tried <= 2 {
-      let cfg = git2::Config::open_default()?;
-      return Cred::credential_helper(&cfg, url, Some(user).filter(|u| *u != "git"));
+    if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) {
+      if tried == 1 {
+        let cfg = git2::Config::open_default()?;
+        if let Ok(c) = Cred::credential_helper(&cfg, url, Some(user).filter(|u| *u != "git")) {
+          return Ok(c);
+        }
+      }
+      if tried <= 2
+        && url.contains("github.com")
+        && let Some(token) = crate::github::token()
+      {
+        return Cred::userpass_plaintext("x-access-token", &token);
+      }
     }
     if allowed.contains(CredentialType::DEFAULT) && tried <= 3 {
       return Cred::default();

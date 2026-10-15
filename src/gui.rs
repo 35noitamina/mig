@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +11,8 @@ use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, config, oplog, ops, repo, rev, scan, split};
+use crate::welcome::{self, Opened, Welcome};
+use crate::{absorb, config, github, oplog, ops, repo, rev, scan, setup, split};
 
 const HISTORY: usize = 300;
 const REFRESH: Duration = Duration::from_secs(3);
@@ -40,8 +41,18 @@ struct SplitDialog {
   message: String,
 }
 
+struct PublishDialog {
+  name: String,
+  private: bool,
+  ssh: bool,
+  token_ok: bool,
+}
+
 struct App {
   repo: Repository,
+  root: PathBuf,
+  leave: bool,
+  publish: Option<PublishDialog>,
   mode: Mode,
   editor: Editor,
   auto_lines: usize,
@@ -62,53 +73,82 @@ struct App {
   last_refresh: Instant,
 }
 
+// Start in `dir` if it is inside a repository, otherwise on the welcome screen.
 pub fn run(dir: PathBuf) -> Result<()> {
-  let repo = repo::open(&dir)?;
-  let root = repo.workdir().unwrap_or(&dir).to_path_buf();
-  let title = format!(
-    "mig — {}",
-    root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-  );
+  let start = repo::open(&dir).ok().and_then(|r| r.workdir().map(|w| w.to_path_buf()));
   let opts = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
-      .with_title(title)
+      .with_title("mig")
       .with_inner_size([1200.0, 780.0]),
     ..Default::default()
   };
   eframe::run_native(
     "mig",
     opts,
-    Box::new(|cc| {
+    Box::new(move |cc| {
       load_cjk_font(&cc.egui_ctx);
-      let cfg = config::load_dir(&root).unwrap_or_default();
-      let mut editor = Editor::new(root.clone());
-      (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
-      let mut app = App {
-        repo,
-        mode: Mode::Editor,
-        editor,
-        auto_lines: cfg.editor.auto_commit_lines,
-        branch: String::new(),
-        rows: vec![],
-        changes: vec![],
-        findings: vec![],
-        alerted: vec![],
-        selected: BTreeSet::new(),
-        view: View::Changes,
-        diff: vec![],
-        message: String::new(),
-        status: Ok(String::new()),
-        confirm_save: None,
-        confirm_sync: None,
-        reword: None,
-        split: None,
-        last_refresh: Instant::now(),
+      let mut shell = Shell {
+        app: None,
+        welcome: Welcome::new(Some(dir), None),
       };
-      app.refresh();
-      Ok(Box::new(app))
+      if let Some(root) = start {
+        shell.open(
+          &cc.egui_ctx,
+          Opened {
+            dir: root,
+            status: String::new(),
+            blocked: None,
+          },
+        );
+      }
+      Ok(Box::new(shell))
     }),
   )
   .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+struct Shell {
+  app: Option<App>,
+  welcome: Welcome,
+}
+
+impl Shell {
+  fn open(&mut self, ctx: &egui::Context, o: Opened) {
+    match App::open(&o.dir) {
+      Ok(mut app) => {
+        welcome::remember(&app.root);
+        let name = app
+          .root
+          .file_name()
+          .map(|n| n.to_string_lossy().into_owned())
+          .unwrap_or_default();
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("mig — {name}")));
+        if !o.status.is_empty() {
+          app.status = Ok(o.status);
+        }
+        app.confirm_save = o.blocked;
+        self.app = Some(app);
+      }
+      Err(e) => self.welcome = Welcome::new(Some(o.dir), Some(format!("{e:#}"))),
+    }
+  }
+}
+
+impl eframe::App for Shell {
+  fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    let ctx = ui.ctx().clone();
+    if let Some(app) = &mut self.app {
+      app.frame(ui, &ctx);
+      if app.leave {
+        let root = app.root.clone();
+        self.app = None;
+        self.welcome = Welcome::new(root.parent().map(Path::to_path_buf), None);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title("mig".into()));
+      }
+    } else if let Some(o) = self.welcome.ui(ui) {
+      self.open(&ctx, o);
+    }
+  }
 }
 
 // egui's bundled fonts have no CJK glyphs; borrow one from the OS when available.
@@ -169,6 +209,40 @@ fn tracked_files(repo: &Repository, changes: &[Change]) -> Vec<String> {
 }
 
 impl App {
+  fn open(dir: &Path) -> Result<App> {
+    let repo = repo::open(dir)?;
+    let root = repo.workdir().unwrap_or(dir).to_path_buf();
+    let cfg = config::load_dir(&root).unwrap_or_default();
+    let mut editor = Editor::new(root.clone());
+    (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
+    let mut app = App {
+      repo,
+      root,
+      leave: false,
+      publish: None,
+      mode: Mode::Editor,
+      editor,
+      auto_lines: cfg.editor.auto_commit_lines,
+      branch: String::new(),
+      rows: vec![],
+      changes: vec![],
+      findings: vec![],
+      alerted: vec![],
+      selected: BTreeSet::new(),
+      view: View::Changes,
+      diff: vec![],
+      message: String::new(),
+      status: Ok(String::new()),
+      confirm_save: None,
+      confirm_sync: None,
+      reword: None,
+      split: None,
+      last_refresh: Instant::now(),
+    };
+    app.refresh();
+    Ok(app)
+  }
+
   fn refresh(&mut self) {
     self.last_refresh = Instant::now();
     self.branch = repo::branch_name(&self.repo).unwrap_or_else(|| "(detached)".into());
@@ -378,6 +452,37 @@ impl App {
 
   fn toolbar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
+      ui.menu_button("Repo", |ui| {
+        if ui.button("Open / new repository…").clicked() {
+          self.leave = true;
+          ui.close();
+        }
+        let has_origin = self.repo.find_remote("origin").is_ok();
+        if ui
+          .add_enabled(!has_origin, egui::Button::new("Publish to GitHub…"))
+          .clicked()
+        {
+          self.publish = Some(PublishDialog {
+            name: setup::default_name(&self.root).replace(' ', "-"),
+            private: true,
+            ssh: false,
+            token_ok: github::token().is_some(),
+          });
+          ui.close();
+        }
+        ui.separator();
+        match setup::remotes(&self.repo) {
+          Ok(list) if !list.is_empty() => {
+            for (name, url) in list {
+              ui.label(RichText::new(format!("{name}  {url}")).monospace().small());
+            }
+          }
+          _ => {
+            ui.label(RichText::new("no remotes").weak());
+          }
+        }
+      });
+      ui.separator();
       ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
       ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
       ui.separator();
@@ -548,7 +653,55 @@ impl App {
     }
   }
 
+  fn publish_dialog(&mut self, ctx: &egui::Context) {
+    let Some(mut d) = self.publish.take() else { return };
+    let mut keep = true;
+    let mut go = false;
+    egui::Window::new("Publish to GitHub")
+      .collapsible(false)
+      .show(ctx, |ui| {
+        ui.horizontal(|ui| {
+          ui.label("Name");
+          ui.add(egui::TextEdit::singleline(&mut d.name).hint_text("name or org/name"));
+        });
+        ui.checkbox(&mut d.private, "Private");
+        ui.checkbox(&mut d.ssh, "Use SSH URL");
+        if !d.token_ok {
+          ui.label(
+            RichText::new("No GitHub token found: set GITHUB_TOKEN or run `gh auth login`")
+              .color(Color32::from_rgb(230, 170, 90)),
+          );
+        }
+        ui.horizontal(|ui| {
+          if ui.button("Cancel").clicked() {
+            keep = false;
+          }
+          if ui
+            .add_enabled(d.token_ok && !d.name.trim().is_empty(), egui::Button::new("Publish"))
+            .clicked()
+          {
+            go = true;
+          }
+        });
+      });
+    if go {
+      let gh = setup::GithubOptions {
+        name: d.name.trim().to_string(),
+        private: d.private,
+        ssh: d.ssh,
+      };
+      let r = setup::create_github(&self.repo, &gh).map(|c| match setup::push_initial(&self.repo, false) {
+        Ok(n) => format!("published {} · pushed {n} commit(s)", c.html_url),
+        Err(e) => format!("published {} · {e}", c.html_url),
+      });
+      self.done(r);
+    } else if keep {
+      self.publish = Some(d);
+    }
+  }
+
   fn dialogs(&mut self, ctx: &egui::Context) {
+    self.publish_dialog(ctx);
     if let Some(blocked) = self.confirm_save.take() {
       let mut keep = true;
       let mut force = false;
@@ -690,9 +843,9 @@ fn notify(summary: &str, body: &str) {
     .show();
 }
 
-impl eframe::App for App {
-  fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-    let ctx = ui.ctx().clone();
+impl App {
+  fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    let ctx = ctx.clone();
     if self.last_refresh.elapsed() >= REFRESH {
       self.refresh();
     }

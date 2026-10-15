@@ -73,28 +73,56 @@ pub fn commands(dir: &Path, cfg: &EditorSection) -> (Option<String>, Option<Stri
   (cfg.check.clone().or(check), cfg.run.clone().or(run))
 }
 
-#[cfg_attr(not(feature = "gui"), allow(dead_code))]
-fn detect(dir: &Path) -> (Option<String>, Option<String>) {
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+  Rust,
+  Node,
+  Go,
+  Python,
+}
+
+impl Kind {
+  pub fn name(self) -> &'static str {
+    match self {
+      Kind::Rust => "Rust",
+      Kind::Node => "Node.js",
+      Kind::Go => "Go",
+      Kind::Python => "Python",
+    }
+  }
+}
+
+pub fn project_kind(dir: &Path) -> Option<Kind> {
   let has = |f: &str| dir.join(f).exists();
-  let s = |a: &str, b: &str| (Some(a.to_string()), Some(b.to_string()));
   if has("Cargo.toml") {
-    s("cargo check", "cargo run")
+    Some(Kind::Rust)
   } else if has("package.json") {
-    s("npm run build --if-present", "npm start")
+    Some(Kind::Node)
   } else if has("go.mod") {
-    s("go build ./...", "go run .")
+    Some(Kind::Go)
   } else if has("pyproject.toml") || has("main.py") || has_py(dir) {
-    // Parse every file instead of compileall, which would leave __pycache__ behind.
-    s(
-      "python -c \"import ast,pathlib;[ast.parse(p.read_bytes(),str(p)) for p in pathlib.Path('.').rglob('*.py') if not {'.venv','venv','node_modules'} & set(p.parts)]\"",
-      "python main.py",
-    )
+    Some(Kind::Python)
   } else {
-    (None, None)
+    None
   }
 }
 
 #[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn detect(dir: &Path) -> (Option<String>, Option<String>) {
+  let s = |a: &str, b: &str| (Some(a.to_string()), Some(b.to_string()));
+  match project_kind(dir) {
+    Some(Kind::Rust) => s("cargo check", "cargo run"),
+    Some(Kind::Node) => s("npm run build --if-present", "npm start"),
+    Some(Kind::Go) => s("go build ./...", "go run ."),
+    // Parse every file instead of compileall, which would leave __pycache__ behind.
+    Some(Kind::Python) => s(
+      "python -c \"import ast,pathlib;[ast.parse(p.read_bytes(),str(p)) for p in pathlib.Path('.').rglob('*.py') if not {'.venv','venv','node_modules'} & set(p.parts)]\"",
+      "python main.py",
+    ),
+    None => (None, None),
+  }
+}
+
 fn has_py(dir: &Path) -> bool {
   std::fs::read_dir(dir)
     .map(|it| it.flatten().any(|e| e.path().extension().is_some_and(|x| x == "py")))

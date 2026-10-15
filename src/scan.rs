@@ -71,7 +71,14 @@ pub use crate::config::CONFIG_FILE;
 
 impl Config {
   pub fn load(repo: &Repository) -> Result<Config> {
-    let fc = crate::config::load(repo)?;
+    match repo.workdir() {
+      Some(dir) => Config::load_dir(dir),
+      None => Config::load_dir(repo.path()),
+    }
+  }
+
+  pub fn load_dir(dir: &std::path::Path) -> Result<Config> {
+    let fc = crate::config::load_dir(dir)?;
     let mut b = GlobSetBuilder::new();
     for g in &fc.scan.ignore_paths {
       b.add(Glob::new(g)?);

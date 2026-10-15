@@ -23,7 +23,8 @@ Linuxでは GUI 実行時に `libxkbcommon-x11` と OpenGL ドライバが必要
 
 | コマンド | 動作 |
 |---|---|
-| `mig init [PATH]` | リポジトリ作成 |
+| `mig init [PATH] [--save] [--remote URL] [--github [NAME]]` | 新しいフォルダ、または既存のフォルダをリポジトリにする（下記） |
+| `mig remote` / `remote add NAME URL` / `remote rm NAME` | リモートの一覧・追加・削除 |
 | `mig st` | 変更状況（シークレット警告つき） |
 | `mig save [-m MSG] [--force] [PATHS…]` | 変更を全部コミット。メッセージ省略時は自動生成 |
 | `mig log [-n N]` | 番号付き履歴（1が最新） |
@@ -43,6 +44,26 @@ Linuxでは GUI 実行時に `libxkbcommon-x11` と OpenGL ドライバが必要
 | `mig gc` | オブジェクトをpackファイルにまとめて不要ファイルを削除 |
 | `mig size [-n N]` | リポジトリ容量と履歴中の大きいファイル |
 | `mig gui` | GUI起動 |
+
+## リポジトリの作成
+
+```sh
+mig init my-app                         # 新しいフォルダを作ってリポジトリに
+mig init --save                         # 今のフォルダをリポジトリにして最初のコミットまで
+mig init --save --github --private      # さらに GitHub に作って push
+mig init --github myorg/tool            # Organization に作る
+```
+
+`.gitignore` がなければプロジェクトの種類（Rust / Node.js / Go / Python）に合わせて作る。どの種類でも `.env` と OS のゴミファイルは除外する（`--no-ignore` で作らない）。
+`--save` の最初のコミットもシークレットと巨大ファイルのチェックを通り、引っかかったらコミットだけ止まる。
+別のリポジトリの中では作らない。既にリポジトリのフォルダでは `--remote` / `--github` / `--save` だけ適用する。
+
+GitHub への作成には `repo` 権限のあるトークンが必要。環境変数 `GITHUB_TOKEN`（または `GH_TOKEN`）か、`gh auth login` 済みの `gh` コマンドから取得する。
+HTTPS の push で認証ヘルパーが使えないときも、github.com ならこのトークンで push する。
+
+GUI では、リポジトリの外で `mig gui` を起動するとようこそ画面になり、フォルダを開く・既存フォルダをリポジトリ化・新規作成ができる。
+作成ダイアログでは対象ファイル数、シークレットや巨大ファイルの警告、`.gitignore` の編集、最初のコミット、GitHub への作成を選べる。
+作業中は `Repo` メニューから別のリポジトリに切り替えたり、origin のないリポジトリを GitHub に公開したりできる。最近開いたリポジトリは設定フォルダの `mig/recent.json` に残る。
 
 REV は `mig log` の番号、`@`（HEAD）、ハッシュやブランチ名が使える。
 

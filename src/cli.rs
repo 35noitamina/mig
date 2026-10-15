@@ -9,7 +9,7 @@ use git2::{DiffFormat, DiffOptions, Oid, Repository};
 
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, gc, oplog, ops, repo, rev, scan, split};
+use crate::{absorb, gc, oplog, ops, repo, rev, scan, setup, split};
 
 #[derive(Parser)]
 #[command(name = "mig", version, about = "A friendlier, git-compatible version control tool")]
@@ -23,8 +23,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-  /// Create a new repository
-  Init { path: Option<PathBuf> },
+  /// Create a repository in a new or existing folder
+  Init {
+    path: Option<PathBuf>,
+    /// Make the first commit too
+    #[arg(long)]
+    save: bool,
+    /// Message for the first commit
+    #[arg(short, long)]
+    message: Option<String>,
+    /// Commit even if secrets or large files are found
+    #[arg(long)]
+    force: bool,
+    /// Add this URL as origin
+    #[arg(long, value_name = "URL")]
+    remote: Option<String>,
+    /// Also create the repository on GitHub ([OWNER/]NAME, defaults to the folder name) and push
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    github: Option<String>,
+    /// Make the GitHub repository private
+    #[arg(long)]
+    private: bool,
+    /// Use the SSH URL for the GitHub remote
+    #[arg(long)]
+    ssh: bool,
+    /// Don't create a .gitignore
+    #[arg(long)]
+    no_ignore: bool,
+  },
+  /// List, add or remove remotes
+  Remote {
+    #[command(subcommand)]
+    cmd: Option<RemoteCmd>,
+  },
   /// Show changed files
   #[command(alias = "status")]
   St,
@@ -127,6 +158,15 @@ enum Cmd {
   Gui,
 }
 
+#[derive(Subcommand)]
+enum RemoteCmd {
+  /// Add a remote
+  Add { name: String, url: String },
+  /// Remove a remote
+  #[command(alias = "remove")]
+  Rm { name: String },
+}
+
 fn color() -> bool {
   std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
 }
@@ -168,14 +208,31 @@ pub fn run() -> Result<()> {
     None => std::env::current_dir()?,
   };
   match cli.cmd {
-    Cmd::Init { path } => {
-      let p = dir.join(path.unwrap_or_default());
-      repo::init(&p)?;
-      println!("initialized {}", p.display());
-      return Ok(());
+    Cmd::Init {
+      path,
+      save,
+      message,
+      force,
+      remote,
+      github,
+      private,
+      ssh,
+      no_ignore,
+    } => {
+      return init(
+        dir.join(path.unwrap_or_default()),
+        save,
+        message,
+        force,
+        remote,
+        github,
+        private,
+        ssh,
+        no_ignore,
+      );
     }
     #[cfg(feature = "gui")]
-    Cmd::Gui => return crate::gui::run(repo::open(&dir)?.workdir().unwrap_or(&dir).to_path_buf()),
+    Cmd::Gui => return crate::gui::run(dir),
     #[cfg(not(feature = "gui"))]
     Cmd::Gui => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
     _ => {}
@@ -401,6 +458,26 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
+    Cmd::Remote { cmd: None } => {
+      for (name, url) in setup::remotes(repo)? {
+        println!("{name}  {url}");
+      }
+      Ok(())
+    }
+    Cmd::Remote {
+      cmd: Some(RemoteCmd::Add { name, url }),
+    } => {
+      setup::add_remote(repo, &name, &url)?;
+      println!("added {name}");
+      Ok(())
+    }
+    Cmd::Remote {
+      cmd: Some(RemoteCmd::Rm { name }),
+    } => {
+      setup::remove_remote(repo, &name)?;
+      println!("removed {name}");
+      Ok(())
+    }
     Cmd::Init { .. } | Cmd::Gui => unreachable!(),
   }
 }
@@ -549,4 +626,82 @@ fn split_interactive(repo: &Repository, pos: usize, message: Option<&str>) -> Re
       }
     }
   })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn init(
+  dir: PathBuf,
+  save: bool,
+  message: Option<String>,
+  force: bool,
+  remote: Option<String>,
+  github: Option<String>,
+  private: bool,
+  ssh: bool,
+  no_ignore: bool,
+) -> Result<()> {
+  let preview = setup::preview(&dir)?;
+  if let Some(k) = preview.kind {
+    println!("detected a {} project", k.name());
+  }
+  if preview.files > 0 {
+    println!("{} file(s), {}", preview.files, guard::fmt_size(preview.bytes));
+  }
+  let github = github.map(|n| setup::GithubOptions {
+    name: if n.is_empty() { setup::default_name(&dir) } else { n },
+    private,
+    ssh,
+  });
+  let out = setup::create(setup::CreateOptions {
+    dir,
+    gitignore: if no_ignore { None } else { preview.gitignore },
+    save,
+    message,
+    force,
+    remote,
+    github,
+  })?;
+  if out.created {
+    println!("initialized {}", out.dir.display());
+  } else {
+    println!("{} is already a repository", out.dir.display());
+  }
+  if out.wrote_gitignore {
+    println!("wrote .gitignore");
+  }
+  if let Some(g) = &out.github {
+    println!("created {} on GitHub: {}", g.full_name, g.html_url);
+  }
+  for w in &out.warnings {
+    eprintln!("{} {w}", paint("33", "warning:"));
+  }
+  if let Some(oid) = out.saved {
+    println!("saved {} Initial commit", paint("33", &repo::short(oid)));
+  }
+  if let Some(b) = &out.blocked {
+    if !b.secrets.is_empty() {
+      print_findings(&b.secrets);
+    }
+    for (path, size) in &b.large {
+      eprintln!("{}", paint("1;31", &format!("⚠ {path} is {}", guard::fmt_size(*size))));
+    }
+    eprintln!("first commit skipped; fix these or run `mig save --force`");
+  } else if !save && preview.files > 0 {
+    if !preview.secrets.is_empty() {
+      print_findings(&preview.secrets);
+    }
+    for (path, size) in &preview.large {
+      eprintln!(
+        "{}",
+        paint("33", &format!("note: {path} is {}", guard::fmt_size(*size)))
+      );
+    }
+  }
+  if out.pushed > 0 {
+    println!("pushed {} commit(s)", out.pushed);
+  }
+  for n in &out.notes {
+    eprintln!("{} {n}", paint("33", "note:"));
+  }
+  Ok(())
 }
