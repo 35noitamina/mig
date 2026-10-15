@@ -373,6 +373,7 @@ enum Action {
 
 enum Top {
   Init(InitArgs),
+  #[cfg_attr(not(feature = "gui"), allow(dead_code))]
   Gui(Option<PathBuf>),
   Repo(Action),
 }
