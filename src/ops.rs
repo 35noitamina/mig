@@ -7,10 +7,16 @@ use git2::{
   Repository, Sort,
 };
 
+use crate::guard::{self, SaveBlocked};
 use crate::scan::{self, SecretsFound};
-use crate::{repo, rev};
+use crate::{config, gc, repo, rev};
 
-pub fn save(repo: &Repository, message: Option<&str>, paths: &[String], force: bool) -> Result<Oid> {
+pub struct Saved {
+  pub oid: Oid,
+  pub warnings: Vec<String>,
+}
+
+pub fn save(repo: &Repository, message: Option<&str>, paths: &[String], force: bool) -> Result<Saved> {
   let mut index = repo.index()?;
   let specs: Vec<&str> = if paths.is_empty() {
     vec!["*"]
@@ -27,10 +33,12 @@ pub fn save(repo: &Repository, message: Option<&str>, paths: &[String], force: b
       bail!("nothing to save");
     }
     let diff = repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+    let cfg = config::load(repo)?;
+    let (large, warnings) = guard::inspect(repo, &diff, (cfg.save.max_file_mb * 1024.0 * 1024.0) as u64)?;
     if !force {
-      let found = scan::scan_diff(repo, &diff)?;
-      if !found.is_empty() {
-        return Err(SecretsFound(found).into());
+      let secrets = scan::scan_diff(repo, &diff)?;
+      if !secrets.is_empty() || !large.is_empty() {
+        return Err(SaveBlocked { secrets, large }.into());
       }
     }
     let msg = match message {
@@ -41,12 +49,24 @@ pub fn save(repo: &Repository, message: Option<&str>, paths: &[String], force: b
     let parents: Vec<&Commit> = parent.iter().collect();
     let oid = repo.commit(Some("HEAD"), &sig, &sig, &msg, &tree, &parents)?;
     index.write()?;
-    Ok(oid)
+    Ok(Saved { oid, warnings })
   })();
   if result.is_err() {
     index.read(true)?;
+  } else {
+    let _ = gc::auto(repo);
   }
   result
+}
+
+// Short description of uncommitted changes, e.g. "Update a.rs, b.rs".
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn pending_summary(repo: &Repository) -> Result<String> {
+  let head = repo::head_commit(repo)?.map(|c| c.tree()).transpose()?;
+  let mut opts = git2::DiffOptions::new();
+  opts.include_untracked(true).recurse_untracked_dirs(true);
+  let diff = repo.diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut opts))?;
+  Ok(auto_message(&diff))
 }
 
 fn auto_message(diff: &git2::Diff<'_>) -> String {
@@ -64,7 +84,12 @@ fn auto_message(diff: &git2::Diff<'_>) -> String {
 
 // Recreate `commits` (oldest first) on top of `onto`. With keep_trees the snapshots stay
 // as they are; otherwise each commit's changes are cherry-picked.
-fn replay(repo: &Repository, commits: &[Commit<'_>], mut onto: Option<Oid>, keep_trees: bool) -> Result<Option<Oid>> {
+pub(crate) fn replay(
+  repo: &Repository,
+  commits: &[Commit<'_>],
+  mut onto: Option<Oid>,
+  keep_trees: bool,
+) -> Result<Option<Oid>> {
   let committer = repo::signature(repo)?;
   for c in commits {
     let tree = if keep_trees {
@@ -73,16 +98,8 @@ fn replay(repo: &Repository, commits: &[Commit<'_>], mut onto: Option<Oid>, keep
       if c.parent_count() > 1 {
         bail!("cannot replay merge commit {}", repo::short(c.id()));
       }
-      let base = repo.find_commit(onto.ok_or_else(|| anyhow!("cannot replay onto an empty history"))?)?;
-      let mut idx = repo.cherrypick_commit(c, &base, 0, None)?;
-      if idx.has_conflicts() {
-        bail!(
-          "conflict while replaying {} \"{}\"",
-          repo::short(c.id()),
-          repo::summary(c)
-        );
-      }
-      repo.find_tree(idx.write_tree_to(repo)?)?
+      let base = onto.ok_or_else(|| anyhow!("cannot replay onto an empty history"))?;
+      repo.find_tree(pick(repo, c, base)?)?
     };
     let mut parent_ids: Vec<Oid> = onto.into_iter().collect();
     parent_ids.extend(c.parent_ids().skip(1));
@@ -97,7 +114,27 @@ fn replay(repo: &Repository, commits: &[Commit<'_>], mut onto: Option<Oid>, keep
   Ok(onto)
 }
 
-fn commit_with(repo: &Repository, base: &Commit<'_>, parents: &[Oid], msg: &str, tree: &git2::Tree<'_>) -> Result<Oid> {
+// Apply the changes of `c` on top of `onto` and return the resulting tree.
+pub(crate) fn pick(repo: &Repository, c: &Commit<'_>, onto: Oid) -> Result<Oid> {
+  let base = repo.find_commit(onto)?;
+  let mut idx = repo.cherrypick_commit(c, &base, 0, None)?;
+  if idx.has_conflicts() {
+    bail!(
+      "conflict while replaying {} \"{}\"",
+      repo::short(c.id()),
+      repo::summary(c)
+    );
+  }
+  Ok(idx.write_tree_to(repo)?)
+}
+
+pub(crate) fn commit_with(
+  repo: &Repository,
+  base: &Commit<'_>,
+  parents: &[Oid],
+  msg: &str,
+  tree: &git2::Tree<'_>,
+) -> Result<Oid> {
   let committer = repo::signature(repo)?;
   let ps: Vec<Commit> = parents
     .iter()
@@ -276,14 +313,7 @@ pub struct SyncReport {
 
 pub fn sync(repo: &Repository, force: bool) -> Result<SyncReport> {
   let branch = repo::branch_name(repo).ok_or_else(|| anyhow!("HEAD is detached; switch to a branch first"))?;
-  let cfg = repo.config()?;
-  let remote_name = cfg
-    .get_string(&format!("branch.{branch}.remote"))
-    .unwrap_or_else(|_| "origin".into());
-  let merge = cfg
-    .get_string(&format!("branch.{branch}.merge"))
-    .unwrap_or_else(|_| format!("refs/heads/{branch}"));
-  let remote_branch = merge.strip_prefix("refs/heads/").unwrap_or(&merge).to_string();
+  let (remote_name, remote_branch) = repo::upstream_names(repo, &branch)?;
   let mut remote = repo
     .find_remote(&remote_name)
     .with_context(|| format!("no remote named {remote_name}"))?;
@@ -365,7 +395,7 @@ pub fn sync(repo: &Repository, force: bool) -> Result<SyncReport> {
 }
 
 // Commits reachable from `tip` but not from `hide`, oldest first.
-fn commits_between(repo: &Repository, tip: Oid, hide: Option<Oid>) -> Result<Vec<Commit<'_>>> {
+pub(crate) fn commits_between(repo: &Repository, tip: Oid, hide: Option<Oid>) -> Result<Vec<Commit<'_>>> {
   let mut walk = repo.revwalk()?;
   walk.push(tip)?;
   if let Some(h) = hide {

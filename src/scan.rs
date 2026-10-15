@@ -6,7 +6,6 @@ use anyhow::Result;
 use git2::{DiffFormat, Repository, Tree};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
-use serde::Deserialize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Finding {
@@ -63,36 +62,16 @@ fn rules() -> &'static [Rule] {
   })
 }
 
-#[derive(Deserialize, Default)]
-struct FileConfig {
-  #[serde(default)]
-  scan: ScanSection,
-}
-
-#[derive(Deserialize, Default)]
-struct ScanSection {
-  #[serde(default)]
-  ignore_paths: Vec<String>,
-  #[serde(default)]
-  allow: Vec<String>,
-}
-
 pub struct Config {
   ignore: GlobSet,
   allow: Vec<String>,
 }
 
-pub const CONFIG_FILE: &str = ".mig.toml";
+pub use crate::config::CONFIG_FILE;
 
 impl Config {
   pub fn load(repo: &Repository) -> Result<Config> {
-    let mut fc = FileConfig::default();
-    if let Some(dir) = repo.workdir() {
-      let p = dir.join(CONFIG_FILE);
-      if p.exists() {
-        fc = toml::from_str(&std::fs::read_to_string(&p)?)?;
-      }
-    }
+    let fc = crate::config::load(repo)?;
     let mut b = GlobSetBuilder::new();
     for g in &fc.scan.ignore_paths {
       b.add(Glob::new(g)?);

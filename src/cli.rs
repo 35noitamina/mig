@@ -7,8 +7,9 @@ use chrono::{Local, TimeZone};
 use clap::{Parser, Subcommand};
 use git2::{DiffFormat, DiffOptions, Oid, Repository};
 
+use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{oplog, ops, repo, rev, scan};
+use crate::{absorb, gc, oplog, ops, repo, rev, scan, split};
 
 #[derive(Parser)]
 #[command(name = "mig", version, about = "A friendlier, git-compatible version control tool")]
@@ -31,7 +32,7 @@ enum Cmd {
   Save {
     #[arg(short, long)]
     message: Option<String>,
-    /// Commit even if secrets are detected
+    /// Commit even if secrets or large files are detected
     #[arg(long)]
     force: bool,
     /// Limit to these paths
@@ -58,6 +59,23 @@ enum Cmd {
   },
   /// Remove a commit from history
   Drop { rev: String },
+  /// Move uncommitted edits into the unpushed commits that last touched those lines
+  Absorb {
+    /// Only show where each change would go
+    #[arg(short = 'n', long)]
+    dry_run: bool,
+  },
+  /// Split a commit in two: the given paths (or hunks picked with -i) go first
+  Split {
+    rev: String,
+    paths: Vec<String>,
+    /// Pick hunks interactively
+    #[arg(short)]
+    i: bool,
+    /// Message for the first commit
+    #[arg(short, long)]
+    message: Option<String>,
+  },
   /// Undo the last operation
   Undo {
     /// Discard unsaved changes
@@ -98,6 +116,13 @@ enum Cmd {
   },
   /// Scan the working tree for API keys and other secrets
   Scan,
+  /// Pack objects with delta compression and remove redundant files
+  Gc,
+  /// Show repository size and the largest files in history
+  Size {
+    #[arg(short = 'n', default_value_t = 10)]
+    count: usize,
+  },
   /// Open the GUI
   Gui,
 }
@@ -163,6 +188,24 @@ pub fn run() -> Result<()> {
       print_findings(found);
       return Err(anyhow!("aborted; re-run with --force to ignore"));
     }
+    if let Some(b) = e.downcast_ref::<SaveBlocked>() {
+      if !b.secrets.is_empty() {
+        print_findings(&b.secrets);
+      }
+      for (path, size) in &b.large {
+        eprintln!(
+          "{}",
+          paint(
+            "1;31",
+            &format!(
+              "⚠ {path} is {} (limit set by [save] max_file_mb)",
+              guard::fmt_size(*size)
+            )
+          )
+        );
+      }
+      return Err(anyhow!("aborted; re-run with --force to ignore"));
+    }
   }
   result
 }
@@ -171,9 +214,12 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
   match cmd {
     Cmd::St => status(repo),
     Cmd::Save { message, force, paths } => {
-      let oid = oplog::record(repo, "save", || ops::save(repo, message.as_deref(), &paths, force))?;
-      let c = repo.find_commit(oid)?;
-      println!("saved {} {}", paint("33", &repo::short(oid)), repo::summary(&c));
+      let saved = oplog::record(repo, "save", || ops::save(repo, message.as_deref(), &paths, force))?;
+      for w in &saved.warnings {
+        eprintln!("{} {w}", paint("33", "warning:"));
+      }
+      let c = repo.find_commit(saved.oid)?;
+      println!("saved {} {}", paint("33", &repo::short(saved.oid)), repo::summary(&c));
       Ok(())
     }
     Cmd::Log { count } => log(repo, count),
@@ -210,6 +256,43 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       let summary = repo::summary(&rev::resolve(repo, &rev)?);
       oplog::record(repo, &format!("drop {}", pos + 1), || ops::drop_commit(repo, pos))?;
       println!("dropped \"{summary}\"");
+      Ok(())
+    }
+    Cmd::Absorb { dry_run } => {
+      let plan = if dry_run {
+        absorb::absorb(repo, true)?
+      } else {
+        oplog::record(repo, "absorb", || absorb::absorb(repo, false))?
+      };
+      for m in &plan.moves {
+        println!(
+          "{}  {}  -> #{} {}",
+          m.path,
+          paint("36", &m.header),
+          m.pos + 1,
+          m.summary
+        );
+      }
+      let verb = if dry_run { "would absorb" } else { "absorbed" };
+      println!(
+        "{verb} {} hunk(s); {} left in the working tree",
+        plan.moves.len(),
+        plan.left
+      );
+      Ok(())
+    }
+    Cmd::Split { rev, paths, i, message } => {
+      let pos = rev::position(repo, &rev)?;
+      let tip = oplog::record(repo, &format!("split {}", pos + 1), || {
+        if i {
+          split_interactive(repo, pos, message.as_deref())
+        } else if paths.is_empty() {
+          Err(anyhow!("give paths for the first commit, or use -i to pick hunks"))
+        } else {
+          split::split_paths(repo, pos, &paths, message.as_deref())
+        }
+      })?;
+      println!("split #{}; HEAD is now {}", pos + 1, paint("33", &repo::short(tip)));
       Ok(())
     }
     Cmd::Undo { force } => {
@@ -292,6 +375,31 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
         print_findings(&found);
         Err(anyhow!("secrets found"))
       }
+    }
+    Cmd::Gc => {
+      let r = gc::gc(repo)?;
+      println!(
+        "packed {} objects, removed {} loose object(s) and {} old pack(s): {} -> {}",
+        r.objects,
+        r.removed_loose,
+        r.removed_packs,
+        guard::fmt_size(r.before),
+        guard::fmt_size(r.after)
+      );
+      Ok(())
+    }
+    Cmd::Size { count } => {
+      let r = gc::size(repo, count)?;
+      println!("loose objects: {} ({})", r.loose_count, guard::fmt_size(r.loose_bytes));
+      println!("packs:         {} ({})", r.pack_count, guard::fmt_size(r.pack_bytes));
+      if r.loose_count > 0 {
+        println!("{}", paint("2", "run `mig gc` to pack loose objects"));
+      }
+      println!("\nlargest files in history (uncompressed):");
+      for (path, size) in r.largest {
+        println!("  {:>10}  {path}", guard::fmt_size(size));
+      }
+      Ok(())
     }
     Cmd::Init { .. } | Cmd::Gui => unreachable!(),
   }
@@ -395,4 +503,50 @@ pub fn render_diff(d: &git2::Diff<'_>, ansi: bool) -> Result<String> {
     true
   })?;
   Ok(out)
+}
+
+fn split_interactive(repo: &Repository, pos: usize, message: Option<&str>) -> Result<Oid> {
+  let stdin = std::io::stdin();
+  let mut quit = false;
+  split::split(repo, pos, message, &mut |fc, hunk| {
+    if quit {
+      return false;
+    }
+    let text = match (hunk, &fc.body) {
+      (Some(h), _) => h.text.clone(),
+      (None, crate::patch::Body::Whole { text }) => text.clone(),
+      _ => String::new(),
+    };
+    println!("{}", paint("1", &fc.path));
+    for l in text.lines() {
+      let code = if l.starts_with('+') {
+        "32"
+      } else if l.starts_with('-') {
+        "31"
+      } else if l.starts_with("@@") {
+        "36"
+      } else {
+        ""
+      };
+      println!("{}", if code.is_empty() { l.to_string() } else { paint(code, l) });
+    }
+    loop {
+      print!("put this in the first commit? [y/n/q] ");
+      let _ = std::io::Write::flush(&mut std::io::stdout());
+      let mut line = String::new();
+      if stdin.read_line(&mut line).unwrap_or(0) == 0 {
+        quit = true;
+        return false;
+      }
+      match line.trim() {
+        "y" => return true,
+        "n" => return false,
+        "q" => {
+          quit = true;
+          return false;
+        }
+        _ => {}
+      }
+    }
+  })
 }

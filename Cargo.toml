@@ -8,6 +8,7 @@ anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 eframe = { version = "0.36.2", optional = true }
+egui_extras = { version = "0.36.2", features = ["syntect"], optional = true }
 git2 = { version = "0.21.0", features = ["https", "ssh"] }
 globset = "0.4.20"
 notify-rust = { version = "4.18.2", optional = true }
@@ -18,4 +19,4 @@ toml = "1.1.8"
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:notify-rust"]
+gui = ["dep:eframe", "dep:egui_extras", "dep:notify-rust"]

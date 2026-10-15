@@ -7,9 +7,11 @@ use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
 use git2::{DiffOptions, Oid, Repository};
 
+use crate::editor::{self, Editor};
+use crate::guard::{self, SaveBlocked};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
-use crate::{oplog, ops, repo, rev, scan};
+use crate::{absorb, config, oplog, ops, repo, rev, scan, split};
 
 const HISTORY: usize = 300;
 const REFRESH: Duration = Duration::from_secs(3);
@@ -26,8 +28,23 @@ enum View {
   Commit(usize),
 }
 
+#[derive(PartialEq, Clone, Copy)]
+enum Mode {
+  Editor,
+  History,
+}
+
+struct SplitDialog {
+  pos: usize,
+  files: Vec<(String, bool)>,
+  message: String,
+}
+
 struct App {
   repo: Repository,
+  mode: Mode,
+  editor: Editor,
+  auto_lines: usize,
   branch: String,
   rows: Vec<Row>,
   changes: Vec<Change>,
@@ -38,22 +55,24 @@ struct App {
   diff: Vec<(Color32, String)>,
   message: String,
   status: Result<String, String>,
-  confirm_save: Option<Vec<Finding>>,
+  confirm_save: Option<SaveBlocked>,
   confirm_sync: Option<Vec<Finding>>,
   reword: Option<(usize, String)>,
+  split: Option<SplitDialog>,
   last_refresh: Instant,
 }
 
 pub fn run(dir: PathBuf) -> Result<()> {
   let repo = repo::open(&dir)?;
+  let root = repo.workdir().unwrap_or(&dir).to_path_buf();
   let title = format!(
     "mig — {}",
-    dir.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+    root.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
   );
   let opts = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_title(title)
-      .with_inner_size([1100.0, 720.0]),
+      .with_inner_size([1200.0, 780.0]),
     ..Default::default()
   };
   eframe::run_native(
@@ -61,8 +80,14 @@ pub fn run(dir: PathBuf) -> Result<()> {
     opts,
     Box::new(|cc| {
       load_cjk_font(&cc.egui_ctx);
+      let cfg = config::load_dir(&root).unwrap_or_default();
+      let mut editor = Editor::new(root.clone());
+      (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
       let mut app = App {
         repo,
+        mode: Mode::Editor,
+        editor,
+        auto_lines: cfg.editor.auto_commit_lines,
         branch: String::new(),
         rows: vec![],
         changes: vec![],
@@ -76,6 +101,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
         confirm_save: None,
         confirm_sync: None,
         reword: None,
+        split: None,
         last_refresh: Instant::now(),
       };
       app.refresh();
@@ -110,6 +136,38 @@ fn load_cjk_font(ctx: &egui::Context) {
   ctx.set_fonts(fonts);
 }
 
+fn workdir_diff(repo: &Repository) -> Result<git2::Diff<'_>> {
+  let head = repo::head_commit(repo)?.map(|c| c.tree()).transpose()?;
+  let mut opts = DiffOptions::new();
+  opts
+    .include_untracked(true)
+    .recurse_untracked_dirs(true)
+    .show_untracked_content(true);
+  Ok(repo.diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut opts))?)
+}
+
+fn tracked_files(repo: &Repository, changes: &[Change]) -> Vec<String> {
+  let mut files: Vec<String> = repo
+    .index()
+    .map(|idx| {
+      idx
+        .iter()
+        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+        .collect()
+    })
+    .unwrap_or_default();
+  files.extend(changes.iter().filter(|c| c.kind == '?').map(|c| c.path.clone()));
+  let deleted: Vec<&str> = changes
+    .iter()
+    .filter(|c| c.kind == 'D')
+    .map(|c| c.path.as_str())
+    .collect();
+  files.retain(|f| !deleted.contains(&f.as_str()));
+  files.sort();
+  files.dedup();
+  files
+}
+
 impl App {
   fn refresh(&mut self) {
     self.last_refresh = Instant::now();
@@ -127,6 +185,10 @@ impl App {
       .unwrap_or_default();
     self.selected.retain(|&i| i < self.rows.len());
     self.changes = repo::changes(&self.repo).unwrap_or_default();
+    self.editor.set_files(
+      tracked_files(&self.repo, &self.changes),
+      self.changes.iter().map(|c| c.path.clone()).collect(),
+    );
     self.findings = scan::scan_pending(&self.repo).unwrap_or_default();
     let fresh: Vec<&Finding> = self.findings.iter().filter(|f| !self.alerted.contains(f)).collect();
     if !fresh.is_empty() {
@@ -141,30 +203,17 @@ impl App {
 
   fn load_diff(&mut self) {
     let d = match self.view {
-      View::Changes => {
-        let head = repo::head_commit(&self.repo).ok().flatten().and_then(|c| c.tree().ok());
-        let mut opts = DiffOptions::new();
-        opts
-          .include_untracked(true)
-          .recurse_untracked_dirs(true)
-          .show_untracked_content(true);
-        self
-          .repo
-          .diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut opts))
-      }
+      View::Changes => workdir_diff(&self.repo),
       View::Commit(i) => {
         let Some(row) = self.rows.get(i) else { return };
-        let c = self.repo.find_commit(row.oid).unwrap();
-        let parent = c.parents().next().and_then(|p| p.tree().ok());
-        self
-          .repo
-          .diff_tree_to_tree(parent.as_ref(), c.tree().ok().as_ref(), None)
+        (|| {
+          let c = self.repo.find_commit(row.oid)?;
+          let parent = c.parents().next().map(|p| p.tree()).transpose()?;
+          Ok(self.repo.diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), None)?)
+        })()
       }
     };
-    let text = d
-      .map_err(anyhow::Error::from)
-      .and_then(|d| crate::cli::render_diff(&d, false))
-      .unwrap_or_default();
+    let text = d.and_then(|d| crate::cli::render_diff(&d, false)).unwrap_or_default();
     self.diff = text
       .lines()
       .take(5000)
@@ -190,18 +239,93 @@ impl App {
     self.refresh();
   }
 
-  fn save(&mut self, force: bool) {
+  fn commit(&mut self, force: bool) {
+    if let Err(e) = self.editor.save_all() {
+      self.status = Err(e);
+      return;
+    }
     let msg = std::mem::take(&mut self.message);
     let r = oplog::record(&self.repo, "save", || ops::save(&self.repo, Some(&msg), &[], force));
     match r {
-      Ok(oid) => self.done(Ok(format!("saved {}", repo::short(oid)))),
+      Ok(s) => {
+        let mut text = format!("saved {}", repo::short(s.oid));
+        for w in s.warnings {
+          text.push_str(&format!(" · warning: {w}"));
+        }
+        self.done(Ok(text));
+      }
       Err(e) => {
         self.message = msg;
-        match e.downcast::<SecretsFound>() {
-          Ok(SecretsFound(f)) => self.confirm_save = Some(f),
+        match e.downcast::<SaveBlocked>() {
+          Ok(b) => self.confirm_save = Some(b),
           Err(e) => self.done(Err(e)),
         }
       }
+    }
+  }
+
+  fn changed_lines(&self) -> usize {
+    workdir_diff(&self.repo)
+      .and_then(|d| Ok(d.stats()?))
+      .map(|s| s.insertions() + s.deletions())
+      .unwrap_or(0)
+  }
+
+  // Called after the editor writes files: auto-commit once enough has changed and the check passes.
+  fn after_save(&mut self, ctx: &egui::Context) {
+    self.refresh();
+    if self.auto_lines == 0 || self.editor.checking() {
+      return;
+    }
+    let n = self.changed_lines();
+    if n < self.auto_lines {
+      return;
+    }
+    match self.editor.check_cmd.clone() {
+      Some(cmd) => self.editor.start_check(&cmd, ctx),
+      None => self.auto_commit(),
+    }
+  }
+
+  fn auto_commit(&mut self) {
+    let msg = format!(
+      "auto: {}",
+      ops::pending_summary(&self.repo).unwrap_or_else(|_| "Update".into())
+    );
+    let r = oplog::record(&self.repo, "save (auto)", || {
+      ops::save(&self.repo, Some(&msg), &[], false)
+    });
+    match r {
+      Ok(s) => {
+        self
+          .editor
+          .output
+          .push(&format!("[mig] auto-committed {} {msg}\n", repo::short(s.oid)));
+        self.done(Ok(format!("auto-committed {}", repo::short(s.oid))));
+      }
+      Err(e) => {
+        let text = format!("auto-commit skipped: {e:#}");
+        self.editor.output.push(&format!("[mig] {text}\n"));
+        if e.is::<SaveBlocked>() {
+          notify("Auto-commit skipped", &e.to_string());
+        }
+        self.done(Err(anyhow::anyhow!(text)));
+      }
+    }
+  }
+
+  fn poll_check(&mut self, ctx: &egui::Context) {
+    let Some((ok, generation)) = self.editor.poll_check() else {
+      return;
+    };
+    if !ok {
+      self.editor.output.push("[mig] check failed; not committing\n");
+      self.status = Err("check failed; auto-commit postponed".into());
+    } else if generation != self.editor.save_gen {
+      // Files changed while checking: check again.
+      self.after_save(ctx);
+    } else {
+      self.auto_commit();
     }
   }
 
@@ -219,6 +343,15 @@ impl App {
         Err(e) => self.done(Err(e)),
       },
     }
+  }
+
+  fn absorb(&mut self) {
+    if let Err(e) = self.editor.save_all() {
+      self.status = Err(e);
+      return;
+    }
+    let r = oplog::record(&self.repo, "absorb", || absorb::absorb(&self.repo, false));
+    self.done(r.map(|p| format!("absorbed {} hunk(s); {} left", p.moves.len(), p.left)));
   }
 
   fn fold_selected(&mut self) {
@@ -245,18 +378,29 @@ impl App {
 
   fn toolbar(&mut self, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
-      ui.label(RichText::new(format!("branch: {}", self.branch)).strong());
+      ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
+      ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
+      ui.separator();
+      ui.label(format!("branch: {}", self.branch));
       ui.separator();
       ui.add(
         egui::TextEdit::singleline(&mut self.message)
-          .hint_text("message (optional)")
-          .desired_width(320.0),
+          .hint_text("commit message (optional)")
+          .desired_width(260.0),
       );
+      let dirty = self.editor.tabs.iter().any(|t| t.dirty());
       if ui
-        .add_enabled(!self.changes.is_empty(), egui::Button::new("Save"))
+        .add_enabled(!self.changes.is_empty() || dirty, egui::Button::new("Commit"))
         .clicked()
       {
-        self.save(false);
+        self.commit(false);
+      }
+      if ui
+        .add_enabled(!self.changes.is_empty() || dirty, egui::Button::new("Absorb"))
+        .on_hover_text("Move edits into the unpushed commits that last touched those lines")
+        .clicked()
+      {
+        self.absorb();
       }
       if ui.button("Sync").clicked() {
         self.sync(false);
@@ -272,6 +416,14 @@ impl App {
       }
       if ui.button("Refresh").clicked() {
         self.refresh();
+      }
+      if self.auto_lines > 0 {
+        ui.label(
+          RichText::new(format!("auto-commit at {} lines", self.auto_lines))
+            .weak()
+            .small(),
+        )
+        .on_hover_text("Set [editor] auto_commit_lines in .mig.toml (0 = off)");
       }
     });
   }
@@ -322,7 +474,7 @@ impl App {
       }
     });
     ui.label(
-      RichText::new("Ctrl/Cmd-click or Shift-click to select several")
+      RichText::new("Ctrl/Cmd-click or Shift-click to select several; right-click for more")
         .small()
         .weak(),
     );
@@ -331,23 +483,23 @@ impl App {
     egui::ScrollArea::vertical().show(ui, |ui| {
       for (i, row) in self.rows.iter().enumerate() {
         let text = format!("{:>3}  {}  {}", i + 1, &row.oid.to_string()[..7], row.summary);
-        let resp = ui.selectable_label(self.selected.contains(&i), RichText::new(text).monospace());
-        let resp = resp.on_hover_text(&row.time);
+        let resp = ui
+          .selectable_label(self.selected.contains(&i), RichText::new(text).monospace())
+          .on_hover_text(&row.time);
         if resp.clicked() {
           clicked = Some(i);
         }
         resp.context_menu(|ui| {
-          if ui.button("Reword…").clicked() {
-            action = Some(("reword", i));
-            ui.close();
-          }
-          if ui.button("Fold into parent").clicked() {
-            action = Some(("fold", i));
-            ui.close();
-          }
-          if ui.button("Drop").clicked() {
-            action = Some(("drop", i));
-            ui.close();
+          for (name, key) in [
+            ("Reword…", "reword"),
+            ("Split…", "split"),
+            ("Fold into parent", "fold"),
+            ("Drop", "drop"),
+          ] {
+            if ui.button(name).clicked() {
+              action = Some((key, i));
+              ui.close();
+            }
           }
         });
       }
@@ -377,6 +529,16 @@ impl App {
           .unwrap_or_default();
         self.reword = Some((i, msg));
       }
+      Some(("split", i)) => match split::files(&self.repo, i) {
+        Ok(files) => {
+          self.split = Some(SplitDialog {
+            pos: i,
+            files: files.into_iter().map(|f| (f, false)).collect(),
+            message: String::new(),
+          })
+        }
+        Err(e) => self.status = Err(format!("{e:#}")),
+      },
       Some(("fold", i)) => {
         self.selected = BTreeSet::from([i]);
         self.fold_selected();
@@ -387,45 +549,50 @@ impl App {
   }
 
   fn dialogs(&mut self, ctx: &egui::Context) {
-    if let Some(found) = self.confirm_save.clone() {
-      let mut close = false;
-      egui::Window::new("Secrets detected")
-        .collapsible(false)
-        .show(ctx, |ui| {
-          findings_list(ui, &found);
-          ui.horizontal(|ui| {
-            if ui.button("Cancel").clicked() {
-              close = true;
-            }
-            if ui.button(RichText::new("Save anyway").color(Color32::RED)).clicked() {
-              close = true;
-              self.confirm_save = None;
-              self.save(true);
-            }
-          });
+    if let Some(blocked) = self.confirm_save.take() {
+      let mut keep = true;
+      let mut force = false;
+      egui::Window::new("Commit blocked").collapsible(false).show(ctx, |ui| {
+        findings_list(ui, &blocked.secrets);
+        for (path, size) in &blocked.large {
+          ui.label(RichText::new(format!("{path}: {} (too large)", guard::fmt_size(*size))).monospace());
+        }
+        ui.horizontal(|ui| {
+          if ui.button("Cancel").clicked() {
+            keep = false;
+          }
+          if ui.button(RichText::new("Commit anyway").color(Color32::RED)).clicked() {
+            keep = false;
+            force = true;
+          }
         });
-      if close {
-        self.confirm_save = None;
+      });
+      if force {
+        self.commit(true);
+      } else if keep {
+        self.confirm_save = Some(blocked);
       }
     }
-    if let Some(found) = self.confirm_sync.clone() {
-      let mut close = false;
+    if let Some(found) = self.confirm_sync.take() {
+      let mut keep = true;
+      let mut force = false;
       egui::Window::new("Push blocked").collapsible(false).show(ctx, |ui| {
         ui.label("Unpushed commits contain possible secrets. Remove them (e.g. Drop) before syncing.");
         findings_list(ui, &found);
         ui.horizontal(|ui| {
           if ui.button("OK").clicked() {
-            close = true;
+            keep = false;
           }
           if ui.button(RichText::new("Push anyway").color(Color32::RED)).clicked() {
-            close = true;
-            self.confirm_sync = None;
-            self.sync(true);
+            keep = false;
+            force = true;
           }
         });
       });
-      if close {
-        self.confirm_sync = None;
+      if force {
+        self.sync(true);
+      } else if keep {
+        self.confirm_sync = Some(found);
       }
     }
     if let Some((i, mut msg)) = self.reword.take() {
@@ -453,6 +620,56 @@ impl App {
         self.reword = Some((i, msg));
       }
     }
+    if let Some(mut d) = self.split.take() {
+      let mut keep = true;
+      let mut apply = false;
+      egui::Window::new(format!("Split #{}", d.pos + 1))
+        .collapsible(false)
+        .show(ctx, |ui| {
+          ui.label("Checked files go into the first commit; the rest stay in the second.");
+          egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+            for (f, on) in &mut d.files {
+              ui.checkbox(on, RichText::new(f.as_str()).monospace());
+            }
+          });
+          ui.add(egui::TextEdit::singleline(&mut d.message).hint_text("first commit message (optional)"));
+          ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+              keep = false;
+            }
+            if ui.button("Split").clicked() {
+              apply = true;
+            }
+          });
+        });
+      if apply {
+        let paths: Vec<String> = d.files.iter().filter(|(_, on)| *on).map(|(f, _)| f.clone()).collect();
+        let msg = Some(d.message.trim()).filter(|m| !m.is_empty());
+        let r = oplog::record(&self.repo, &format!("split {}", d.pos + 1), || {
+          split::split_paths(&self.repo, d.pos, &paths, msg)
+        });
+        self.selected.clear();
+        self.view = View::Changes;
+        self.done(r.map(|_| format!("split #{}", d.pos + 1)));
+      } else if keep {
+        self.split = Some(d);
+      }
+    }
+  }
+
+  fn history(&mut self, ui: &mut egui::Ui) {
+    egui::Panel::left("side")
+      .resizable(true)
+      .default_size(380.0)
+      .show(ui, |ui| self.sidebar(ui));
+    egui::CentralPanel::default_margins().show(ui, |ui| {
+      self.banner(ui);
+      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        for (col, line) in &self.diff {
+          ui.label(RichText::new(line).monospace().color(*col));
+        }
+      });
+    });
   }
 }
 
@@ -479,7 +696,12 @@ impl eframe::App for App {
     if self.last_refresh.elapsed() >= REFRESH {
       self.refresh();
     }
-    ctx.request_repaint_after(REFRESH);
+    self.poll_check(&ctx);
+    ctx.request_repaint_after(if self.editor.checking() || self.editor.running() {
+      Duration::from_millis(200)
+    } else {
+      REFRESH
+    });
 
     egui::Panel::top("toolbar").show(ui, |ui| {
       ui.add_space(4.0);
@@ -494,18 +716,24 @@ impl eframe::App for App {
         ui.label(RichText::new(e).color(Color32::from_rgb(230, 110, 110)));
       }
     });
-    egui::Panel::left("side")
-      .resizable(true)
-      .default_size(380.0)
-      .show(ui, |ui| self.sidebar(ui));
-    egui::CentralPanel::default_margins().show(ui, |ui| {
-      self.banner(ui);
-      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        for (col, line) in &self.diff {
-          ui.label(RichText::new(line).monospace().color(*col));
+    match self.mode {
+      Mode::History => self.history(ui),
+      Mode::Editor => {
+        if !self.findings.is_empty() {
+          egui::Panel::top("editor-banner").show(ui, |ui| self.banner(ui));
         }
-      });
-    });
+        let mut saved = false;
+        for ev in self.editor.ui(ui) {
+          match ev {
+            editor::Event::Saved => saved = true,
+            editor::Event::Error(e) => self.status = Err(e),
+          }
+        }
+        if saved {
+          self.after_save(&ctx);
+        }
+      }
+    }
     self.dialogs(&ctx);
   }
 }

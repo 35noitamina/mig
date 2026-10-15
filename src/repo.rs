@@ -120,3 +120,22 @@ pub fn checkout_head_force(repo: &Repository) -> Result<()> {
 pub fn short(oid: Oid) -> String {
   oid.to_string()[..7].to_string()
 }
+
+// (remote, branch on the remote) for a local branch; defaults to origin/<same name>.
+pub fn upstream_names(repo: &Repository, branch: &str) -> Result<(String, String)> {
+  let cfg = repo.config()?;
+  let remote = cfg
+    .get_string(&format!("branch.{branch}.remote"))
+    .unwrap_or_else(|_| "origin".into());
+  let merge = cfg
+    .get_string(&format!("branch.{branch}.merge"))
+    .unwrap_or_else(|_| format!("refs/heads/{branch}"));
+  let name = merge.strip_prefix("refs/heads/").unwrap_or(&merge).to_string();
+  Ok((remote, name))
+}
+
+pub fn upstream(repo: &Repository) -> Option<Oid> {
+  let branch = branch_name(repo)?;
+  let (remote, name) = upstream_names(repo, &branch).ok()?;
+  repo.refname_to_id(&format!("refs/remotes/{remote}/{name}")).ok()
+}
