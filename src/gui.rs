@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -16,6 +17,8 @@ use crate::{absorb, config, github, oplog, ops, repo, rev, scan, setup, split};
 
 const HISTORY: usize = 300;
 const REFRESH: Duration = Duration::from_secs(3);
+const DIFF_LINES: usize = 5000;
+const LIST_LIMIT: usize = 500;
 
 struct Row {
   oid: Oid,
@@ -71,6 +74,119 @@ struct App {
   reword: Option<(usize, String)>,
   split: Option<SplitDialog>,
   last_refresh: Instant,
+  ctx: egui::Context,
+  loading: Option<Receiver<Result<Update>>>,
+  scan_cache: Option<scan::Cache>,
+  loaded: bool,
+  refresh_again: bool,
+  refresh_every: Duration,
+  workdir_lines: Vec<(Color32, String)>,
+  changed_lines: usize,
+  auto_pending: bool,
+  saving: Option<SaveJob>,
+}
+
+struct SaveJob {
+  rx: Receiver<Result<ops::Saved>>,
+  auto: bool,
+  message: String,
+}
+
+// Pieces of the screen, computed off the UI thread and sent cheapest first.
+enum Update {
+  History {
+    branch: String,
+    rows: Vec<Row>,
+  },
+  Changes {
+    changes: Vec<Change>,
+    files: Vec<String>,
+  },
+  Details {
+    findings: Vec<Finding>,
+    workdir_lines: Vec<(Color32, String)>,
+    changed_lines: Option<usize>,
+    cache: scan::Cache,
+  },
+  Done(Duration),
+}
+
+fn load_snapshot(
+  root: &Path,
+  want_stats: bool,
+  mut cache: scan::Cache,
+  tx: &mpsc::Sender<Result<Update>>,
+) -> Result<()> {
+  let started = Instant::now();
+  let repo = repo::open(root)?;
+  let rows = rev::chain(&repo, HISTORY)?
+    .iter()
+    .map(|c| Row {
+      oid: c.id(),
+      summary: repo::summary(c),
+      time: crate::cli::fmt_time(c.time().seconds()),
+    })
+    .collect();
+  let branch = repo::branch_name(&repo).unwrap_or_else(|| "(detached)".into());
+  let _ = tx.send(Ok(Update::History { branch, rows }));
+
+  let changes = repo::changes(&repo)?;
+  let files = tracked_files(&repo, &changes);
+  let untracked: Vec<String> = changes
+    .iter()
+    .filter(|c| c.kind == '?')
+    .map(|c| c.path.clone())
+    .collect();
+  let _ = tx.send(Ok(Update::Changes { changes, files }));
+
+  let findings = scan::scan_pending_with(&repo, &untracked, &mut cache)?;
+  let diff = workdir_diff(&repo)?;
+  let workdir_lines = diff_lines(&diff, DIFF_LINES);
+  // Line stats read every changed file, so only compute them when auto-commit asks.
+  let changed_lines = want_stats.then(|| diff.stats().map(|s| s.insertions() + s.deletions()).unwrap_or(0));
+  let _ = tx.send(Ok(Update::Details {
+    findings,
+    workdir_lines,
+    changed_lines,
+    cache,
+  }));
+  let _ = tx.send(Ok(Update::Done(started.elapsed())));
+  Ok(())
+}
+
+fn line_color(l: &str) -> Color32 {
+  if l.starts_with("diff --git") || l.starts_with("+++") || l.starts_with("---") {
+    Color32::from_rgb(200, 200, 120)
+  } else if l.starts_with('+') {
+    Color32::from_rgb(110, 200, 110)
+  } else if l.starts_with('-') {
+    Color32::from_rgb(230, 110, 110)
+  } else if l.starts_with("@@") {
+    Color32::from_rgb(100, 180, 220)
+  } else {
+    Color32::GRAY
+  }
+}
+
+// Render at most `max` lines; libgit2 stops generating the patch once the callback says so.
+fn diff_lines(d: &git2::Diff<'_>, max: usize) -> Vec<(Color32, String)> {
+  let mut out: Vec<(Color32, String)> = Vec::new();
+  let _ = d.print(git2::DiffFormat::Patch, |_, _, line| {
+    let prefix = match line.origin() {
+      c @ ('+' | '-' | ' ') => c.to_string(),
+      _ => String::new(),
+    };
+    let text = String::from_utf8_lossy(line.content());
+    for l in format!("{prefix}{text}").lines() {
+      out.push((line_color(l), l.to_string()));
+    }
+    out.len() < max
+  });
+  if out.len() >= max {
+    out.truncate(max);
+    out.push((Color32::GRAY, format!("… diff truncated after {max} lines")));
+  }
+  out
 }
 
 // Start in `dir` if it is inside a repository, otherwise on the welcome screen.
@@ -87,6 +203,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
     opts,
     Box::new(move |cc| {
       load_cjk_font(&cc.egui_ctx);
+      cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
       let mut shell = Shell {
         app: None,
         welcome: Welcome::new(Some(dir), None),
@@ -114,7 +231,7 @@ struct Shell {
 
 impl Shell {
   fn open(&mut self, ctx: &egui::Context, o: Opened) {
-    match App::open(&o.dir) {
+    match App::open(&o.dir, ctx) {
       Ok(mut app) => {
         welcome::remember(&app.root);
         let name = app
@@ -179,10 +296,12 @@ fn load_cjk_font(ctx: &egui::Context) {
 fn workdir_diff(repo: &Repository) -> Result<git2::Diff<'_>> {
   let head = repo::head_commit(repo)?.map(|c| c.tree()).transpose()?;
   let mut opts = DiffOptions::new();
+  // Files over 2 MB are treated as binary so big data files are never read whole.
   opts
     .include_untracked(true)
     .recurse_untracked_dirs(true)
-    .show_untracked_content(true);
+    .show_untracked_content(true)
+    .max_size(2 * 1024 * 1024);
   Ok(repo.diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut opts))?)
 }
 
@@ -209,7 +328,7 @@ fn tracked_files(repo: &Repository, changes: &[Change]) -> Vec<String> {
 }
 
 impl App {
-  fn open(dir: &Path) -> Result<App> {
+  fn open(dir: &Path, ctx: &egui::Context) -> Result<App> {
     let repo = repo::open(dir)?;
     let root = repo.workdir().unwrap_or(dir).to_path_buf();
     let cfg = config::load_dir(&root).unwrap_or_default();
@@ -238,74 +357,131 @@ impl App {
       reword: None,
       split: None,
       last_refresh: Instant::now(),
+      ctx: ctx.clone(),
+      loading: None,
+      scan_cache: Some(scan::Cache::new()),
+      loaded: false,
+      refresh_again: false,
+      refresh_every: REFRESH,
+      workdir_lines: vec![],
+      changed_lines: 0,
+      auto_pending: false,
+      saving: None,
     };
     app.refresh();
     Ok(app)
   }
 
+  // Starts a background refresh; results are applied by poll_refresh as they arrive.
   fn refresh(&mut self) {
     self.last_refresh = Instant::now();
-    self.branch = repo::branch_name(&self.repo).unwrap_or_else(|| "(detached)".into());
-    self.rows = rev::chain(&self.repo, HISTORY)
-      .map(|cs| {
-        cs.iter()
-          .map(|c| Row {
-            oid: c.id(),
-            summary: repo::summary(c),
-            time: crate::cli::fmt_time(c.time().seconds()),
-          })
-          .collect()
-      })
-      .unwrap_or_default();
-    self.selected.retain(|&i| i < self.rows.len());
-    self.changes = repo::changes(&self.repo).unwrap_or_default();
-    self.editor.set_files(
-      tracked_files(&self.repo, &self.changes),
-      self.changes.iter().map(|c| c.path.clone()).collect(),
-    );
-    self.findings = scan::scan_pending(&self.repo).unwrap_or_default();
-    let fresh: Vec<&Finding> = self.findings.iter().filter(|f| !self.alerted.contains(f)).collect();
-    if !fresh.is_empty() {
-      notify(
-        &format!("{} possible secret(s) in your changes", fresh.len()),
-        &fresh[0].path,
-      );
+    if self.loading.is_some() {
+      self.refresh_again = true;
+      return;
     }
-    self.alerted = self.findings.clone();
-    self.load_diff();
+    let (tx, rx) = mpsc::channel();
+    let root = self.root.clone();
+    let ctx = self.ctx.clone();
+    let want_stats = self.auto_pending;
+    let cache = self.scan_cache.take().unwrap_or_default();
+    std::thread::spawn(move || {
+      if let Err(e) = load_snapshot(&root, want_stats, cache, &tx) {
+        let _ = tx.send(Err(e));
+      }
+      ctx.request_repaint();
+    });
+    self.loading = Some(rx);
+  }
+
+  fn poll_refresh(&mut self, ctx: &egui::Context) {
+    loop {
+      let Some(rx) = &self.loading else { return };
+      let update = match rx.try_recv() {
+        Ok(u) => u,
+        Err(mpsc::TryRecvError::Empty) => return,
+        Err(mpsc::TryRecvError::Disconnected) => Ok(Update::Done(REFRESH)),
+      };
+      match update {
+        Ok(Update::History { branch, rows }) => {
+          self.branch = branch;
+          self.rows = rows;
+          self.selected.retain(|&i| i < self.rows.len());
+          self.loaded = true;
+        }
+        Ok(Update::Changes { changes, files }) => {
+          let changed = changes.iter().map(|c| c.path.clone()).collect();
+          self.changes = changes;
+          self.editor.set_files(files, changed);
+        }
+        Ok(Update::Details {
+          findings,
+          workdir_lines,
+          changed_lines,
+          cache,
+        }) => {
+          self.scan_cache = Some(cache);
+          self.findings = findings;
+          let fresh: Vec<&Finding> = self.findings.iter().filter(|f| !self.alerted.contains(f)).collect();
+          if !fresh.is_empty() {
+            notify(
+              &format!("{} possible secret(s) in your changes", fresh.len()),
+              &fresh[0].path,
+            );
+          }
+          self.alerted = self.findings.clone();
+          self.workdir_lines = workdir_lines;
+          self.load_diff();
+          if let Some(n) = changed_lines {
+            self.changed_lines = n;
+            if std::mem::take(&mut self.auto_pending) {
+              self.maybe_auto_commit(ctx);
+            }
+          }
+        }
+        Ok(Update::Done(took)) => {
+          // Slow trees get refreshed less often so the machine isn't kept busy.
+          self.refresh_every = REFRESH.max(took * 4);
+          self.finish_refresh();
+        }
+        Err(e) => {
+          self.status = Err(format!("{e:#}"));
+          self.finish_refresh();
+        }
+      }
+    }
+  }
+
+  fn finish_refresh(&mut self) {
+    self.loading = None;
+    self.loaded = true;
+    self.last_refresh = Instant::now();
+    if self.scan_cache.is_none() {
+      self.scan_cache = Some(scan::Cache::new());
+    }
+    if std::mem::take(&mut self.refresh_again) || self.auto_pending {
+      self.refresh();
+    }
   }
 
   fn load_diff(&mut self) {
-    let d = match self.view {
-      View::Changes => workdir_diff(&self.repo),
+    self.diff = match self.view {
+      View::Changes => self.workdir_lines.clone(),
       View::Commit(i) => {
         let Some(row) = self.rows.get(i) else { return };
-        (|| {
+        let d = (|| -> Result<git2::Diff<'_>> {
           let c = self.repo.find_commit(row.oid)?;
           let parent = c.parents().next().map(|p| p.tree()).transpose()?;
-          Ok(self.repo.diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), None)?)
-        })()
+          let mut opts = DiffOptions::new();
+          opts.max_size(2 * 1024 * 1024);
+          Ok(
+            self
+              .repo
+              .diff_tree_to_tree(parent.as_ref(), Some(&c.tree()?), Some(&mut opts))?,
+          )
+        })();
+        d.map(|d| diff_lines(&d, DIFF_LINES)).unwrap_or_default()
       }
     };
-    let text = d.and_then(|d| crate::cli::render_diff(&d, false)).unwrap_or_default();
-    self.diff = text
-      .lines()
-      .take(5000)
-      .map(|l| {
-        let col = if l.starts_with("diff --git") || l.starts_with("+++") || l.starts_with("---") {
-          Color32::from_rgb(200, 200, 120)
-        } else if l.starts_with('+') {
-          Color32::from_rgb(110, 200, 110)
-        } else if l.starts_with('-') {
-          Color32::from_rgb(230, 110, 110)
-        } else if l.starts_with("@@") {
-          Color32::from_rgb(100, 180, 220)
-        } else {
-          Color32::GRAY
-        };
-        (col, l.to_string())
-      })
-      .collect();
   }
 
   fn done(&mut self, r: Result<String>) {
@@ -319,65 +495,81 @@ impl App {
       return;
     }
     let msg = std::mem::take(&mut self.message);
-    let r = oplog::record(&self.repo, "save", || ops::save(&self.repo, Some(&msg), &[], force));
-    match r {
-      Ok(s) => {
+    self.start_save(msg, force, false);
+  }
+
+  // Saving a big tree can take a while, so it runs on its own thread with its own handle.
+  fn start_save(&mut self, message: String, force: bool, auto: bool) {
+    if self.saving.is_some() {
+      return;
+    }
+    let (tx, rx) = mpsc::channel();
+    let root = self.root.clone();
+    let ctx = self.ctx.clone();
+    let msg = message.clone();
+    std::thread::spawn(move || {
+      let r = repo::open(&root).and_then(|repo| {
+        let text = if auto {
+          format!(
+            "auto: {}",
+            ops::pending_summary(&repo).unwrap_or_else(|_| "Update".into())
+          )
+        } else {
+          msg
+        };
+        let cmd = if auto { "save (auto)" } else { "save" };
+        oplog::record(&repo, cmd, || ops::save(&repo, Some(&text), &[], force))
+      });
+      let _ = tx.send(r);
+      ctx.request_repaint();
+    });
+    self.saving = Some(SaveJob { rx, auto, message });
+    self.status = Ok(if auto {
+      "auto-committing…".into()
+    } else {
+      "committing…".into()
+    });
+  }
+
+  fn poll_save(&mut self) {
+    let Some(job) = &self.saving else { return };
+    let r = match job.rx.try_recv() {
+      Ok(r) => r,
+      Err(mpsc::TryRecvError::Empty) => return,
+      Err(mpsc::TryRecvError::Disconnected) => Err(anyhow::anyhow!("save failed")),
+    };
+    let job = self.saving.take().unwrap();
+    match (r, job.auto) {
+      (Ok(s), false) => {
         let mut text = format!("saved {}", repo::short(s.oid));
         for w in s.warnings {
           text.push_str(&format!(" · warning: {w}"));
         }
         self.done(Ok(text));
       }
-      Err(e) => {
-        self.message = msg;
-        match e.downcast::<SaveBlocked>() {
-          Ok(b) => self.confirm_save = Some(b),
-          Err(e) => self.done(Err(e)),
-        }
-      }
-    }
-  }
-
-  fn changed_lines(&self) -> usize {
-    workdir_diff(&self.repo)
-      .and_then(|d| Ok(d.stats()?))
-      .map(|s| s.insertions() + s.deletions())
-      .unwrap_or(0)
-  }
-
-  // Called after the editor writes files: auto-commit once enough has changed and the check passes.
-  fn after_save(&mut self, ctx: &egui::Context) {
-    self.refresh();
-    if self.auto_lines == 0 || self.editor.checking() {
-      return;
-    }
-    let n = self.changed_lines();
-    if n < self.auto_lines {
-      return;
-    }
-    match self.editor.check_cmd.clone() {
-      Some(cmd) => self.editor.start_check(&cmd, ctx),
-      None => self.auto_commit(),
-    }
-  }
-
-  fn auto_commit(&mut self) {
-    let msg = format!(
-      "auto: {}",
-      ops::pending_summary(&self.repo).unwrap_or_else(|_| "Update".into())
-    );
-    let r = oplog::record(&self.repo, "save (auto)", || {
-      ops::save(&self.repo, Some(&msg), &[], false)
-    });
-    match r {
-      Ok(s) => {
+      (Ok(s), true) => {
+        let c = self
+          .repo
+          .find_commit(s.oid)
+          .map(|c| repo::summary(&c))
+          .unwrap_or_default();
         self
           .editor
           .output
-          .push(&format!("[mig] auto-committed {} {msg}\n", repo::short(s.oid)));
+          .push(&format!("[mig] auto-committed {} {c}\n", repo::short(s.oid)));
         self.done(Ok(format!("auto-committed {}", repo::short(s.oid))));
       }
-      Err(e) => {
+      (Err(e), false) => {
+        self.message = job.message;
+        match e.downcast::<SaveBlocked>() {
+          Ok(b) => {
+            self.confirm_save = Some(b);
+            self.status = Ok(String::new());
+          }
+          Err(e) => self.done(Err(e)),
+        }
+      }
+      (Err(e), true) => {
         let text = format!("auto-commit skipped: {e:#}");
         self.editor.output.push(&format!("[mig] {text}\n"));
         if e.is::<SaveBlocked>() {
@@ -385,6 +577,25 @@ impl App {
         }
         self.done(Err(anyhow::anyhow!(text)));
       }
+    }
+  }
+
+  // Called after the editor writes files; the decision waits for fresh line counts.
+  fn after_save(&mut self) {
+    self.auto_pending = true;
+    self.refresh();
+  }
+
+  fn maybe_auto_commit(&mut self, ctx: &egui::Context) {
+    if self.auto_lines == 0 || self.editor.checking() || self.saving.is_some() {
+      return;
+    }
+    if self.changed_lines < self.auto_lines {
+      return;
+    }
+    match self.editor.check_cmd.clone() {
+      Some(cmd) => self.editor.start_check(&cmd, ctx),
+      None => self.start_save(String::new(), false, true),
     }
   }
 
@@ -397,9 +608,10 @@ impl App {
       self.status = Err("check failed; auto-commit postponed".into());
     } else if generation != self.editor.save_gen {
       // Files changed while checking: check again.
-      self.after_save(ctx);
+      let _ = ctx;
+      self.after_save();
     } else {
-      self.auto_commit();
+      self.start_save(String::new(), false, true);
     }
   }
 
@@ -495,7 +707,10 @@ impl App {
       );
       let dirty = self.editor.tabs.iter().any(|t| t.dirty());
       if ui
-        .add_enabled(!self.changes.is_empty() || dirty, egui::Button::new("Commit"))
+        .add_enabled(
+          self.saving.is_none() && (!self.changes.is_empty() || dirty),
+          egui::Button::new("Commit"),
+        )
         .clicked()
       {
         self.commit(false);
@@ -562,9 +777,21 @@ impl App {
       self.selected.clear();
       self.load_diff();
     }
-    for c in &self.changes {
-      ui.label(RichText::new(format!("  {} {}", c.kind, c.path)).monospace().small());
-    }
+    egui::ScrollArea::vertical()
+      .id_salt("changes")
+      .max_height(180.0)
+      .show(ui, |ui| {
+        for c in self.changes.iter().take(LIST_LIMIT) {
+          ui.label(RichText::new(format!("  {} {}", c.kind, c.path)).monospace().small());
+        }
+        if self.changes.len() > LIST_LIMIT {
+          ui.label(
+            RichText::new(format!("  …and {} more", self.changes.len() - LIST_LIMIT))
+              .small()
+              .weak(),
+          );
+        }
+      });
     ui.separator();
     ui.horizontal(|ui| {
       ui.label(RichText::new("History").strong());
@@ -585,7 +812,7 @@ impl App {
     );
     let mut clicked = None;
     let mut action = None;
-    egui::ScrollArea::vertical().show(ui, |ui| {
+    egui::ScrollArea::vertical().id_salt("history").show(ui, |ui| {
       for (i, row) in self.rows.iter().enumerate() {
         let text = format!("{:>3}  {}  {}", i + 1, &row.oid.to_string()[..7], row.summary);
         let resp = ui
@@ -817,11 +1044,15 @@ impl App {
       .show(ui, |ui| self.sidebar(ui));
     egui::CentralPanel::default_margins().show(ui, |ui| {
       self.banner(ui);
-      egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
-        for (col, line) in &self.diff {
-          ui.label(RichText::new(line).monospace().color(*col));
-        }
-      });
+      // Only the visible rows are laid out, so long diffs stay cheap.
+      let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+      egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .show_rows(ui, row_h, self.diff.len(), |ui, range| {
+          for (col, line) in &self.diff[range] {
+            ui.label(RichText::new(line).monospace().color(*col));
+          }
+        });
     });
   }
 }
@@ -846,28 +1077,42 @@ fn notify(summary: &str, body: &str) {
 impl App {
   fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
     let ctx = ctx.clone();
-    if self.last_refresh.elapsed() >= REFRESH {
+    self.poll_refresh(&ctx);
+    self.poll_save();
+    if self.loading.is_none() && self.last_refresh.elapsed() >= self.refresh_every {
       self.refresh();
     }
     self.poll_check(&ctx);
-    ctx.request_repaint_after(if self.editor.checking() || self.editor.running() {
-      Duration::from_millis(200)
-    } else {
-      REFRESH
-    });
+    ctx.request_repaint_after(
+      if self.editor.checking() || self.editor.running() || self.saving.is_some() {
+        Duration::from_millis(200)
+      } else {
+        REFRESH
+      },
+    );
 
     egui::Panel::top("toolbar").show(ui, |ui| {
       ui.add_space(4.0);
       self.toolbar(ui);
       ui.add_space(4.0);
     });
-    egui::Panel::bottom("status").show(ui, |ui| match &self.status {
-      Ok(s) => {
-        ui.label(s);
-      }
-      Err(e) => {
-        ui.label(RichText::new(e).color(Color32::from_rgb(230, 110, 110)));
-      }
+    egui::Panel::bottom("status").show(ui, |ui| {
+      ui.horizontal(|ui| {
+        if self.loading.is_some() || self.saving.is_some() {
+          ui.spinner();
+          if !self.loaded {
+            ui.label("loading repository…");
+          }
+        }
+        match &self.status {
+          Ok(s) => {
+            ui.label(s);
+          }
+          Err(e) => {
+            ui.label(RichText::new(e).color(Color32::from_rgb(230, 110, 110)));
+          }
+        }
+      });
     });
     match self.mode {
       Mode::History => self.history(ui),
@@ -883,7 +1128,7 @@ impl App {
           }
         }
         if saved {
-          self.after_save(&ctx);
+          self.after_save();
         }
       }
     }

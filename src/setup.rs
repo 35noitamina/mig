@@ -13,6 +13,8 @@ use crate::{oplog, ops, repo};
 
 const MAX_PREVIEW_FILES: usize = 100_000;
 const MAX_SCAN_BYTES: u64 = 2 * 1024 * 1024;
+// Stop reading file contents for the secret preview after this much.
+const MAX_SCAN_TOTAL: u64 = 256 * 1024 * 1024;
 
 pub fn gitignore_for(kind: Option<Kind>) -> String {
   let mut s = String::from("# secrets\n.env\n.env.*\n!.env.example\n\n# OS files\n.DS_Store\nThumbs.db\n");
@@ -81,6 +83,7 @@ pub fn preview(dir: &Path) -> Result<Preview> {
   let max = (cfg.save.max_file_mb * 1024.0 * 1024.0) as u64;
   let scan_cfg = scan::Config::load_dir(dir)?;
   let files = list_files(dir, p.gitignore.as_deref().unwrap_or(""))?;
+  let mut scanned = 0u64;
   for (rel, size) in files {
     p.files += 1;
     p.bytes += size;
@@ -89,9 +92,11 @@ pub fn preview(dir: &Path) -> Result<Preview> {
       continue;
     }
     if size <= MAX_SCAN_BYTES
+      && scanned + size <= MAX_SCAN_TOTAL
       && let Ok(bytes) = std::fs::read(dir.join(&rel))
       && !bytes.contains(&0)
     {
+      scanned += size;
       scan::scan_text(&scan_cfg, &rel, &String::from_utf8_lossy(&bytes), &mut p.secrets);
     }
   }

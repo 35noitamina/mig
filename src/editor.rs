@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -10,6 +10,7 @@ use egui_extras::syntax_highlighting::{self, CodeTheme};
 
 const MAX_OPEN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_OUTPUT: usize = 200_000;
+const MAX_LISTED: usize = 1000;
 
 pub struct Tab {
   pub path: String,
@@ -141,8 +142,8 @@ pub enum Event {
 
 pub struct Editor {
   root: PathBuf,
-  files: Vec<String>,
-  changed: Vec<String>,
+  files: Node,
+  changed: HashSet<String>,
   pub tabs: Vec<Tab>,
   active: usize,
   new_file: String,
@@ -158,8 +159,8 @@ impl Editor {
   pub fn new(root: PathBuf) -> Editor {
     Editor {
       root,
-      files: vec![],
-      changed: vec![],
+      files: Node::default(),
+      changed: HashSet::new(),
       tabs: vec![],
       active: 0,
       new_file: String::new(),
@@ -173,8 +174,8 @@ impl Editor {
   }
 
   pub fn set_files(&mut self, files: Vec<String>, changed: Vec<String>) {
-    self.files = files;
-    self.changed = changed;
+    self.files = Node::build(&files);
+    self.changed = changed.into_iter().collect();
     // Pick up changes made on disk (undo, drop, switch...) in tabs without unsaved edits.
     let root = self.root.clone();
     self.tabs.retain_mut(|t| {
@@ -339,9 +340,7 @@ impl Editor {
         });
         ui.separator();
         egui::ScrollArea::vertical().show(ui, |ui| {
-          let files = self.files.clone();
-          let refs: Vec<&str> = files.iter().map(String::as_str).collect();
-          if let Some(p) = self.tree(ui, "", &refs)
+          if let Some(p) = self.tree(ui, &self.files)
             && let Err(e) = self.open(&p)
           {
             events.push(Event::Error(e));
@@ -462,36 +461,60 @@ impl Editor {
   }
 
   // Draws a directory level; returns a file path when one is clicked.
-  fn tree(&self, ui: &mut egui::Ui, prefix: &str, paths: &[&str]) -> Option<String> {
-    let mut dirs: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    let mut files = Vec::new();
-    for p in paths {
-      match p.split_once('/') {
-        Some((d, rest)) => dirs.entry(d).or_default().push(rest),
-        None => files.push(*p),
-      }
-    }
+  // Collapsed folders draw nothing, so huge trees cost only what is open.
+  fn tree(&self, ui: &mut egui::Ui, node: &Node) -> Option<String> {
     let mut clicked = None;
-    for (d, children) in dirs {
-      let full = format!("{prefix}{d}/");
-      let r = egui::CollapsingHeader::new(d)
-        .id_salt(&full)
-        .show(ui, |ui| self.tree(ui, &full, &children));
+    for (name, child) in &node.dirs {
+      let r = egui::CollapsingHeader::new(name.as_str())
+        .id_salt(&child.path)
+        .show(ui, |ui| self.tree(ui, child));
       if let Some(Some(p)) = r.body_returned {
         clicked = Some(p);
       }
     }
-    for f in files {
-      let full = format!("{prefix}{f}");
-      let open = self.tabs.get(self.active).is_some_and(|t| t.path == full);
-      let mut text = RichText::new(f);
-      if self.changed.contains(&full) {
+    for (name, full) in node.files.iter().take(MAX_LISTED) {
+      let open = self.tabs.get(self.active).is_some_and(|t| &t.path == full);
+      let mut text = RichText::new(name.as_str());
+      if self.changed.contains(full) {
         text = text.color(Color32::from_rgb(220, 180, 90));
       }
       if ui.selectable_label(open, text).clicked() {
-        clicked = Some(full);
+        clicked = Some(full.clone());
       }
     }
+    if node.files.len() > MAX_LISTED {
+      ui.label(RichText::new(format!("…and {} more files", node.files.len() - MAX_LISTED)).weak());
+    }
     clicked
+  }
+}
+
+#[derive(Default)]
+struct Node {
+  path: String,
+  dirs: BTreeMap<String, Node>,
+  // (name, full path)
+  files: Vec<(String, String)>,
+}
+
+impl Node {
+  fn build(paths: &[String]) -> Node {
+    let mut root = Node::default();
+    for p in paths {
+      let mut node = &mut root;
+      let mut parts = p.split('/').peekable();
+      while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+          node.files.push((part.to_string(), p.clone()));
+        } else {
+          let path = format!("{}{part}/", node.path);
+          node = node.dirs.entry(part.to_string()).or_insert_with(|| Node {
+            path,
+            ..Default::default()
+          });
+        }
+      }
+    }
+    root
   }
 }

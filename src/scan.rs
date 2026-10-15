@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use git2::{DiffFormat, Repository, Tree};
@@ -68,6 +70,8 @@ pub struct Config {
 }
 
 pub use crate::config::CONFIG_FILE;
+
+const MAX_TEXT: u64 = 2 * 1024 * 1024;
 
 impl Config {
   pub fn load(repo: &Repository) -> Result<Config> {
@@ -186,17 +190,50 @@ pub fn scan_trees(repo: &Repository, old: Option<&Tree<'_>>, new: &Tree<'_>) -> 
   scan_diff(repo, &diff)
 }
 
+// Findings for untracked files, keyed by path and reused while size and mtime match.
+pub type Cache = HashMap<String, (u64, Option<SystemTime>, Vec<Finding>)>;
+
 // Uncommitted changes (including untracked files) relative to HEAD.
 pub fn scan_pending(repo: &Repository) -> Result<Vec<Finding>> {
+  let untracked: Vec<String> = crate::repo::changes(repo)?
+    .into_iter()
+    .filter(|c| c.kind == '?')
+    .map(|c| c.path)
+    .collect();
+  scan_pending_with(repo, &untracked, &mut Cache::new())
+}
+
+// Tracked edits are scanned through the diff (added lines only); untracked files are read
+// directly, which is much cheaper than building patches for them.
+pub fn scan_pending_with(repo: &Repository, untracked: &[String], cache: &mut Cache) -> Result<Vec<Finding>> {
   let head = crate::repo::head_commit(repo)?;
   let tree = head.as_ref().map(|c| c.tree()).transpose()?;
   let mut opts = git2::DiffOptions::new();
-  opts
-    .include_untracked(true)
-    .recurse_untracked_dirs(true)
-    .show_untracked_content(true);
+  opts.max_size(MAX_TEXT as i64);
   let diff = repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?;
-  scan_diff(repo, &diff)
+  let mut out = scan_diff(repo, &diff)?;
+  let cfg = Config::load(repo)?;
+  let Some(root) = repo.workdir() else { return Ok(out) };
+  let mut keep = HashMap::with_capacity(untracked.len());
+  for p in untracked {
+    let meta = std::fs::metadata(root.join(p)).ok();
+    let size = meta.as_ref().map_or(0, |m| m.len());
+    let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+    let found = match cache.remove(p) {
+      Some((s, t, f)) if s == size && t == mtime => f,
+      _ => {
+        let mut f = Vec::new();
+        if let Some(text) = read_text(&root.join(p)) {
+          scan_text(&cfg, p, &text, &mut f);
+        }
+        f
+      }
+    };
+    out.extend(found.iter().cloned());
+    keep.insert(p.clone(), (size, mtime, found));
+  }
+  *cache = keep;
+  Ok(out)
 }
 
 // Every tracked and untracked file currently in the working tree.
@@ -226,7 +263,7 @@ pub fn scan_worktree(repo: &Repository) -> Result<Vec<Finding>> {
 
 fn read_text(path: &Path) -> Option<String> {
   let meta = std::fs::metadata(path).ok()?;
-  if !meta.is_file() || meta.len() > 2 * 1024 * 1024 {
+  if !meta.is_file() || meta.len() > MAX_TEXT {
     return None;
   }
   let bytes = std::fs::read(path).ok()?;
