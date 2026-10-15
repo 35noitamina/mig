@@ -1,15 +1,15 @@
 # mig
 
-git 互換のバージョン管理ツール。中身は普通の `.git` なので、git や GitHub とそのまま併用できる。
+git 互換のバージョン管理ツールです。中身は普通の `.git` なので、git や GitHub とそのまま併用できます。
 
-- ステージング不要。`mig save` で変更をまとめてコミット
-- 履歴の編集が簡単（統合・分割・削除・メッセージ修正・absorb）
-- どんな操作も `mig undo` で取り消せる
-- API キーや巨大ファイルのうっかりコミット／push を防ぐ
-- ネイティブ GUI（エディタ・実行・自動コミット付き）
-- AI 連携：コミットメッセージ、説明・レビュー、履歴の整理、AI エージェント作業の巻き戻し、MCP サーバー（Anthropic / OpenAI / OpenRouter / Gemini など各社に対応）
+- ステージングは不要です。`mig save` で変更をまとめてコミットします
+- 履歴の編集が簡単です（統合・分割・削除・メッセージ修正・absorb）
+- どんな操作も `mig undo` で取り消せます
+- API キーや巨大ファイルのうっかりコミット／push を防ぎます
+- ネイティブ GUI を備えています（エディタ・実行・自動コミット付き）
+- AI 連携に対応しています：コミットメッセージ、説明・レビュー、履歴の整理、AI エージェント作業の巻き戻し、MCP サーバー（Anthropic / OpenAI / OpenRouter / Gemini など各社に対応）
 
-このドキュメントは 2 部構成になっている。
+このドキュメントは 2 部構成です。
 
 | 読む人 | 場所 | 内容 |
 |---|---|---|
@@ -23,7 +23,7 @@ git 互換のバージョン管理ツール。中身は普通の `.git` なの�
 
 ### インストール
 
-[Rust](https://rustup.rs) を入れてから:
+[Rust](https://rustup.rs) を入れてから、次を実行します。
 
 ```sh
 git clone https://github.com/35noitamina/mig
@@ -38,7 +38,7 @@ cargo install --path . --no-default-features  # CLI のみ（軽い）
 | macOS | `xcode-select --install`、`brew install openssl@3` |
 | Linux | `build-essential pkg-config libssl-dev`、GUI 用に `libxkbcommon-x11-0` と OpenGL ドライバ |
 
-コミットの作者情報を一度だけ設定しておく（GUI の Settings → Identity からでも可）:
+コミットの作者情報を一度だけ設定しておきます（GUI の Settings → Identity からでも設定できます）。
 
 ```sh
 git config --global user.name "名前"
@@ -68,15 +68,15 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 
 ### コマンド
 
-コマンドは用途ごとのグループに分かれている。毎日使うものだけはグループ名なしで打てる。
-`mig --help`、`mig <グループ> --help` で一覧と説明が出る。
+コマンドは用途ごとのグループに分かれています。毎日使うものだけは、グループ名なしで打てます。
+`mig --help` や `mig <グループ> --help` で、一覧と説明が出ます。
 
 #### 毎日使う
 
 | コマンド | 内容 |
 |---|---|
 | `mig st` | 変更されたファイルの一覧（シークレットが含まれていれば警告） |
-| `mig save [-m MSG] [PATH…]` | 変更を全部コミット。メッセージを省略すると自動で付く |
+| `mig save [-m MSG] [PATH…]` | 変更を全部コミットします。メッセージを省略すると自動で付きます |
 | `mig sync` | fetch → 自分のコミットを最新の上に付け直し → push |
 | `mig log [-n N]` | 番号付きの履歴（1 が最新） |
 | `mig diff [REV]` | 未保存の差分、または指定コミットの差分 |
@@ -87,7 +87,7 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 
 | コマンド | 内容 |
 |---|---|
-| `mig h fold 2..5` | 2〜5 番のコミットを 1 つに統合。`fold 3` なら 3 番を親と統合、引数なしなら 1 番と 2 番 |
+| `mig h fold 2..5` | 2〜5 番のコミットを 1 つに統合します。`fold 3` なら 3 番を親と統合、引数なしなら 1 番と 2 番を統合します |
 | `mig h reword REV -m MSG` | コミットメッセージを修正 |
 | `mig h drop REV` | コミットを履歴から削除 |
 | `mig h split REV PATH…` | 指定したパスの変更を 1 つ目、残りを 2 つ目のコミットに分割（`-i` で hunk ごとに選ぶ） |
@@ -164,13 +164,13 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 | コマンド | 内容 |
 |---|---|
 | `mig gui` | ようこそ画面で起動 |
-| `mig gui here` / `mig gui PATH` | 今のフォルダ（または指定したフォルダ）のリポジトリを直接開く。リポジトリでなければようこそ画面 |
+| `mig gui here` / `mig gui PATH` | 今のフォルダ（または指定したフォルダ）のリポジトリを直接開きます。リポジトリでなければ、ようこそ画面を開きます |
 
 #### 共通
 
-- `REV` には `mig log` の番号、`@`（最新）、コミットハッシュ、ブランチ名が使える
-- `-C DIR` を付けると、そのフォルダで実行したのと同じになる
-- 以前の書き方（`mig init`、`mig fold`、`mig gc`、`mig oplog`、`mig br NAME`、`mig br -d NAME` など）もそのまま使える
+- `REV` には、`mig log` の番号、`@`（最新）、コミットハッシュ、ブランチ名が使えます
+- `-C DIR` を付けると、そのフォルダで実行したのと同じになります
+- 以前の書き方（`mig init`、`mig fold`、`mig gc`、`mig oplog`、`mig br NAME`、`mig br -d NAME` など）も、そのまま使えます
 
 ---
 
@@ -184,13 +184,13 @@ mig repo init --github myorg/tool          # Organization に作る
 mig repo init --remote URL                 # origin を登録
 ```
 
-- `.gitignore` がなければプロジェクトの種類（Rust / Node.js / Go / Python）に合わせて作る。どの種類でも `.env` と OS のゴミファイルは除外する（`--no-ignore` で作らない）
-- `--save` の最初のコミットもシークレットと巨大ファイルのチェックを通る。引っかかったらコミットだけ止まる
-- 別のリポジトリの中には作らない。すでにリポジトリのフォルダでは `--save` / `--remote` / `--github` だけ適用する
+- `.gitignore` がなければ、プロジェクトの種類（Rust / Node.js / Go / Python）に合わせて作ります。どの種類でも `.env` と OS のゴミファイルは除外します（`--no-ignore` で作らないこともできます）
+- `--save` の最初のコミットも、シークレットと巨大ファイルのチェックを通ります。引っかかった場合は、コミットだけが止まります
+- 別のリポジトリの中には作りません。すでにリポジトリになっているフォルダでは、`--save` / `--remote` / `--github` だけを適用します
 
-GitHub への作成（`--github`、`mig remote publish`）には `repo` 権限のあるトークンが必要。
-環境変数 `GITHUB_TOKEN`（または `GH_TOKEN`）か、`gh auth login` 済みの `gh` コマンドから読み取る。mig 自身はトークンを保存しない。
-HTTPS の push で git の認証ヘルパーが使えないときも、github.com ならこのトークンで push する。
+GitHub への作成（`--github`、`mig remote publish`）には、`repo` 権限のあるトークンが必要です。
+環境変数 `GITHUB_TOKEN`（または `GH_TOKEN`）か、`gh auth login` 済みの `gh` コマンドから読み取ります。mig 自身はトークンを保存しません。
+HTTPS で push するとき、git の認証ヘルパーが使えない場合も、github.com ならこのトークンで push します。
 
 ---
 
@@ -198,7 +198,7 @@ HTTPS の push で git の認証ヘルパーが使えないときも、github.co
 
 #### シークレット（API キーなど）
 
-AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密鍵、`api_key = "..."` のような推測しにくい値を検出する。
+AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密鍵、`api_key = "..."` のような推測しにくい値を検出します。
 
 | タイミング | 動作 |
 |---|---|
@@ -206,29 +206,29 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | `mig sync` | 未 push のコミットに含まれていたら push を止める |
 | `mig st`、GUI | 未保存の変更に含まれていれば警告（GUI は OS の通知も出す） |
 
-誤検知は、その行に `mig:allow` と書くか `.mig.toml` で除外する。
+誤検知は、その行に `mig:allow` と書くか、`.mig.toml` で除外してください。
 
 #### 巨大ファイルと改行コード
 
-- 上限（初期値 10 MB）を超えるファイルは、シークレットと同じくコミットを止める
-- CRLF と LF の混在や、ファイル全体の改行コードの変更は警告だけ出す
+- 上限（初期値 10 MB）を超えるファイルは、シークレットと同じようにコミットを止めます
+- CRLF と LF の混在や、ファイル全体の改行コードの変更は、警告だけ出します
 
 ---
 
 ### GUI
 
-`mig gui` で起動する。リポジトリの外ではようこそ画面になり、リポジトリを開く・既存フォルダをリポジトリにする・新規作成ができる。
+`mig gui` で起動します。リポジトリの外ではようこそ画面になり、リポジトリを開く・既存のフォルダをリポジトリにする・新規作成する、のどれかを選べます。
 
 | 画面 | できること |
 |---|---|
-| Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。Ctrl/Cmd+S で保存 |
-| ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられる |
-| History | 履歴と差分。複数選択して Fold、右クリックで Reword / Split / Fold / Drop |
+| Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。保存は Ctrl/Cmd+S です |
+| ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられます |
+| History | 履歴と差分を表示します。複数選択して Fold でき、右クリックで Reword / Split / Fold / Drop を選べます |
 | ツールバー | Commit、Absorb、Sync、Undo、Redo、Repo メニュー（リポジトリの切り替え、GitHub への公開）、Settings |
 
-**自動コミット**: エディタで保存するたびに前回のコミットからの変更行数を数え、上限（初期値 200 行）を超えたらチェックコマンドを実行する。成功すれば `auto: ...` というメッセージで自動コミットする（push はしない）。失敗したらコミットせず、出力パネルにエラーを出す。
+**自動コミット**: エディタで保存するたびに、前回のコミットからの変更行数を数えます。上限（初期値 200 行）を超えたらチェックコマンドを実行し、成功すれば `auto: ...` というメッセージで自動コミットします（push はしません）。失敗した場合はコミットせず、出力パネルにエラーを出します。
 
-チェック・実行コマンドは設定がなければプロジェクトから推測する。
+チェック・実行コマンドは、設定がなければプロジェクトから推測します。
 
 | プロジェクト | チェック | 実行 |
 |---|---|---|
@@ -237,9 +237,9 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | Go（`go.mod`） | `go build ./...` | `go run .` |
 | Python（`*.py`） | 全 `.py` の構文チェック | `python main.py` |
 
-ボタンにマウスを乗せると短い説明が出る。
+ボタンにマウスを乗せると、短い説明が出ます。
 
-大きなフォルダでも画面が止まらないよう、状態の読み込み・コミット・作成は裏で行い、履歴 → 変更一覧 → 差分の順に表示する。
+大きなフォルダでも画面が止まらないよう、状態の読み込み・コミット・作成は裏で行い、履歴 → 変更一覧 → 差分の順に表示します。
 
 ---
 
@@ -266,27 +266,27 @@ mig ai key openrouter        # キーを貼り付けて Enter
 mig ai msg
 ```
 
-- モデルの初期値は Anthropic のみ（`claude-opus-5-5`）。ほかの提供元はモデル名の指定が必要
-- キーは環境変数を優先し、なければ `mig ai key` / GUI で保存したもの（設定フォルダの `credentials.toml`、自分だけが読める権限）を使う。リポジトリには保存しない
-- **送信前に、シークレットらしい値はすべて `[REDACTED]` に置き換える**（置き換えた数を表示）。それ以外の差分やファイルの中身は選んだ提供元に送られる
-- 長すぎる差分は途中で切り、切ったことを AI にも伝える
-- 設定は設定フォルダの `mig/ai.toml`。GUI では Settings → AI（Test ボタンで疎通確認できる）
+- モデルの初期値があるのは Anthropic（`claude-opus-5-5`）だけです。ほかの提供元では、モデル名を指定する必要があります
+- キーは環境変数を優先し、なければ `mig ai key` や GUI で保存したもの（設定フォルダの `credentials.toml`、自分だけが読める権限）を使います。リポジトリには保存しません
+- **送信前に、シークレットらしい値はすべて `[REDACTED]` に置き換えます**（置き換えた数も表示します）。それ以外の差分やファイルの中身は、選んだ提供元に送られます
+- 長すぎる差分は途中で切り、切ったことを AI にも伝えます
+- 設定は設定フォルダの `mig/ai.toml` に保存されます。GUI では Settings → AI から変更でき、Test ボタンで疎通を確認できます
 
-GUI では、ツールバーの **AI**（コミットメッセージ）、History の **Explain** / **Review** / **AI tidy**、コミットの右クリック、**Agent** メニュー、Repo メニューの **Copy context for AI** から使える。
+GUI では、ツールバーの **AI**（コミットメッセージ）、History の **Explain** / **Review** / **AI tidy**、コミットの右クリック、**Agent** メニュー、Repo メニューの **Copy context for AI** から使えます。
 
 #### エージェントのセッション
 
-Claude Code などの AI エージェントに作業を任せる前に `mig agent start` しておくと、
+Claude Code などの AI エージェントに作業を任せる前に `mig agent start` しておくと、次のことができます。
 
-- エージェントの作業中も `mig agent cp` で細かく状態を残せる（ブランチやコミット履歴は汚さない）
-- 終わったら `mig agent finish` で 1 つのきれいなコミットに（`--ai` でメッセージも AI が書く）
-- 気に入らなければ `mig agent abort` で開始前の状態に戻る。捨てた作業も `mig agent restore <ID>` で取り戻せる
+- エージェントの作業中も、`mig agent cp` で細かく状態を残せます（ブランチやコミット履歴は汚れません）
+- 終わったら、`mig agent finish` で 1 つのきれいなコミットにまとめられます（`--ai` を付けると、メッセージも AI が書きます）
+- 気に入らなければ、`mig agent abort` で開始前の状態に戻せます。捨てた作業も、`mig agent restore <ID>` で取り戻せます
 
-状態は `refs/mig/agent/*` と `.git/mig/agent.json` に保存され、push されない。
+状態は `refs/mig/agent/*` と `.git/mig/agent.json` に保存され、push されません。
 
 #### MCP サーバー
 
-`mig mcp` は MCP（Model Context Protocol）サーバーとして標準入出力で動く。AI クライアントの設定に次のように登録する（パスは自分のリポジトリに置き換える）。
+`mig mcp` は、MCP（Model Context Protocol）サーバーとして標準入出力で動きます。AI クライアントの設定に、次のように登録します（パスは自分のリポジトリに置き換えてください）。
 
 ```json
 {
@@ -296,12 +296,12 @@ Claude Code などの AI エージェントに作業を任せる前に `mig agen
 }
 ```
 
-使えるツール: `status`、`diff`、`log`、`context`、`save`、`undo`、`scan`、`agent_start`、`checkpoint`、`agent_finish`、`agent_abort`。
-`save` はシークレットや巨大ファイルがあると拒否し、`diff` / `context` の出力はシークレットを伏せ字にする。
+使えるツールは、`status`、`diff`、`log`、`context`、`save`、`undo`、`scan`、`agent_start`、`checkpoint`、`agent_finish`、`agent_abort` です。
+`save` はシークレットや巨大ファイルがあると拒否し、`diff` と `context` の出力ではシークレットを伏せ字にします。
 
 ### 設定
 
-GUI の **Settings**（ようこそ画面では下の **Settings…**）から変更できる。
+GUI の **Settings**（ようこそ画面では、下の **Settings…**）から変更できます。
 
 | タブ | 内容 | 保存先 |
 |---|---|---|
@@ -311,7 +311,7 @@ GUI の **Settings**（ようこそ画面では下の **Settings…**）から�
 | AI | 提供元、モデル、ベース URL、回答の言語、API キー、疎通テスト | 設定フォルダの `mig/ai.toml` と `mig/credentials.toml` |
 | GitHub | トークンが見つかるかの確認 | — |
 
-`.mig.toml` は手で書いてもよい。GUI から保存したときは、変更した項目だけを書き換えてコメントは残す。
+`.mig.toml` は手で書いても構いません。GUI から保存したときは、変更した項目だけを書き換え、コメントは残します。
 
 ```toml
 [editor]
@@ -327,7 +327,7 @@ ignore_paths = ["tests/fixtures/**"]
 allow = ["AKIAIOSFODNN7EXAMPLE"]
 ```
 
-設定フォルダは Linux なら `~/.config/mig/`、macOS なら `~/Library/Application Support/mig/`、Windows なら `%APPDATA%\mig\`。最近開いたリポジトリの一覧（`recent.json`）もここに入る。
+設定フォルダは、Linux なら `~/.config/mig/`、macOS なら `~/Library/Application Support/mig/`、Windows なら `%APPDATA%\mig\` です。最近開いたリポジトリの一覧（`recent.json`）もここに入ります。
 
 ---
 
@@ -335,29 +335,29 @@ allow = ["AKIAIOSFODNN7EXAMPLE"]
 
 #### undo
 
-すべての操作で、ブランチ・タグ・HEAD の状態を前後で記録する（`.git/mig/oplog.json`）。
-undo / redo はその記録に戻し、作業ツリーも合わせる。未保存の変更があるときは止まる（`--force` で破棄して実行）。
-`sync` を undo しても手元が戻るだけで、リモートは戻らない。
+すべての操作で、ブランチ・タグ・HEAD の状態を前後で記録します（`.git/mig/oplog.json`）。
+undo / redo は、その記録の状態に戻し、作業ツリーも合わせます。未保存の変更があるときは止まります（`--force` を付けると、破棄して実行します）。
+`sync` を undo しても戻るのは手元だけで、リモートは戻りません。
 
 #### gc
 
-libgit2 には `git gc` 相当の自動整理がないため、mig が自前で行う。
-参照・reflog・操作ログ・インデックスから辿れるオブジェクトを 1 つの pack にまとめ、その中に入ったバラバラのオブジェクトと、中身がすべて新しい pack に含まれる古い pack を削除する。
-どこからも辿れないオブジェクトは 14 日経ってから削除する。バラバラのオブジェクトが 1000 個を超えると、save の後に自動で実行される。
+libgit2 には `git gc` に相当する自動整理がないため、mig が自前で行います。
+参照・reflog・操作ログ・インデックスから辿れるオブジェクトを 1 つの pack にまとめ、その中に入ったバラバラのオブジェクトと、中身がすべて新しい pack に含まれる古い pack を削除します。
+どこからも辿れないオブジェクトは、14 日経ってから削除します。バラバラのオブジェクトが 1000 個を超えると、save の後に自動で実行されます。
 
 ---
 
 ## AI 向けガイド
 
-mig を**操作する** AI エージェント（Claude Code など）と、mig の**コードを読み書きする** AI のための節。
-そのまま `AGENTS.md` / `CLAUDE.md` に貼って使ってもよい。人間向けの説明は上の「人間向けガイド」を見ること。
+mig を**操作する** AI エージェント（Claude Code など）と、mig の**コードを読み書きする** AI のための節です。
+そのまま `AGENTS.md` や `CLAUDE.md` に貼って使っても構いません。人間向けの説明は、上の「人間向けガイド」を見てください。
 
 ### 1. 要点
 
-- mig は `.git` をそのまま使う。`git` コマンドと混ぜて使ってよいが、**履歴を書き換える操作（fold / reword / drop / split / absorb / agent finish・abort）は mig で行う**こと。undo の記録は mig の操作だけが残す
-- 出力は**人間向けのプレーンテキスト**。`--json` は無い。パースするなら `mig log` の番号付き行や `mig st` の `記号 パス` 行など、下の「出力」の形に頼る。構造化データが要るなら MCP（`mig mcp`）を使う
-- **コミットや push の前に必ず `mig st` で状態を確認**する。シークレットや巨大ファイルがあると `mig save` / `mig sync` は止まる
-- 失敗しても多くの操作は `mig undo` で戻せる（戻せないものは「5. 戻せない・戻りにくいもの」）
+- mig は `.git` をそのまま使います。`git` コマンドと混ぜて使っても構いませんが、**履歴を書き換える操作（fold / reword / drop / split / absorb / agent finish・abort）は mig で行ってください**。undo の記録を残すのは、mig の操作だけです
+- 出力は**人間向けのプレーンテキスト**で、`--json` はありません。パースする場合は、`mig log` の番号付き行や `mig st` の `記号 パス` 行など、下の「出力と終了コード」にある形に頼ってください。構造化データが必要なら MCP（`mig mcp`）を使います
+- **コミットや push の前に、必ず `mig st` で状態を確認してください**。シークレットや巨大ファイルがあると、`mig save` と `mig sync` は止まります
+- 失敗しても、多くの操作は `mig undo` で戻せます（戻せないものは「5. 戻せない・戻りにくいもの」を参照してください）
 
 ### 2. 推奨ワークフロー（エージェントが作業するとき）
 
@@ -372,23 +372,23 @@ mig agent finish -m "変更の要約" # 4a. 開始以降の作業を 1 つのコ
 mig agent abort                 # 4b. または、すべて捨てて開始前に戻して終了
 ```
 
-- セッションは同時に 1 つだけ。`mig agent status` で現在の状態が分かる
-- `finish` は、開始以降に自分で作ったコミットと未保存の変更をまとめて**1 つのコミット**にする。push はしない（公開するなら人間の指示を受けてから `mig sync`）
-- `abort` は、ファイルの内容とブランチの位置を**開始時点に戻す**。開始時点で既にあった未保存の変更は残る。捨てた作業は `refs/mig/saved` に残り、`mig agent restore <表示された ID>` で取り戻せる
-- `cp` は変更が無ければ何も作らず「nothing changed since the last checkpoint」を出す（終了コードは 0）
-- `mig agent restore N` は作業ツリーをチェックポイント N（`mig agent log` の番号）の状態に戻す。戻す前の状態も自動で保存される
+- セッションは同時に 1 つだけ持てます。`mig agent status` で現在の状態を確認できます
+- `finish` は、開始以降に自分で作ったコミットと未保存の変更を、**1 つのコミット**にまとめます。push はしません（公開する場合は、人間の指示を受けてから `mig sync` を実行してください）
+- `abort` は、ファイルの内容とブランチの位置を**開始時点に戻します**。開始時点で既にあった未保存の変更は残ります。捨てた作業は `refs/mig/saved` に残り、`mig agent restore <表示された ID>` で取り戻せます
+- `cp` は、変更がなければ何も作らず、「nothing changed since the last checkpoint」と表示します（終了コードは 0 です）
+- `mig agent restore N` は、作業ツリーをチェックポイント N（`mig agent log` の番号）の状態に戻します。戻す前の状態も自動で保存されます
 
-セッションを使わない小さな作業なら、`mig st` → 編集 → `mig save -m "..."` で十分。
+セッションを使わない小さな作業なら、`mig st` → 編集 → `mig save -m "..."` で十分です。
 
 ### 3. やってはいけないこと
 
 | してはいけない | 理由と代わりの手段 |
 |---|---|
-| ユーザーの許可なく `--force` を付ける | `save --force` はシークレットや巨大ファイルのチェックを飛ばす。`sync --force` は秘密情報の入ったコミットを push する。まず `mig repo scan` で内容を確認し、誤検知なら該当行に `mig:allow` を書くか `.mig.toml` で除外する |
+| ユーザーの許可なく `--force` を付ける | `save --force` はシークレットや巨大ファイルのチェックを飛ばし、`sync --force` は秘密情報の入ったコミットを push してしまいます。まず `mig repo scan` で内容を確認し、誤検知なら該当行に `mig:allow` を書くか、`.mig.toml` で除外してください |
 | ユーザーの許可なく `mig sync` で push する | push は mig では取り消せない（`mig undo` は手元の状態しか戻さない） |
-| push 済みのコミットを `fold` / `drop` / `reword` / `split` する | 公開済みの履歴を書き換えると他の人と食い違う。mig はこの操作を止めないので、自分で気を付ける。`absorb` は未 push のコミットしか対象にしない。迷ったら人間に確認する |
-| `mig undo --force` / `mig redo --force` | 未保存の変更を**捨てる**。通常の `undo` は未保存の変更があると止まるので、先に `mig save` するか `mig agent cp` で残す |
-| `mig h split -i` | hunk ごとに標準入力で y/n を聞く対話式。エージェントからはパス指定の `mig h split REV PATH…` を使う |
+| push 済みのコミットを `fold` / `drop` / `reword` / `split` する | 公開済みの履歴を書き換えると、他の人の履歴と食い違います。mig はこの操作を止めないので、自分で気を付けてください。`absorb` は未 push のコミットしか対象にしません。迷ったら人間に確認してください |
+| `mig undo --force` / `mig redo --force` | 未保存の変更を**捨ててしまいます**。通常の `undo` は未保存の変更があると止まるので、先に `mig save` するか、`mig agent cp` で残してください |
+| `mig h split -i` | hunk ごとに標準入力で y/n を聞く対話式です。エージェントからは、パスを指定する `mig h split REV PATH…` を使ってください |
 | `.mig.toml` や `.gitignore` を黙って緩める | 検出や除外の設定を変えるときは、変えたことをユーザーに伝える |
 | API キーを出力・コミット・メッセージに含める | `mig context` / MCP の出力と AI への送信内容は自動で `[REDACTED]` に置き換わるが、ファイルの中身そのものは自分で扱いに注意する |
 
@@ -398,12 +398,12 @@ mig agent abort                 # 4b. または、すべて捨てて開始前に
 |---|---|
 | 終了コード | `0` 成功、`1` 失敗（実行時のエラー、シークレット等で止められた場合を含む）、`2` コマンドの使い方の誤り |
 | 通常の結果 | 標準出力 |
-| エラー・警告・シークレットの指摘 | 標準エラー出力。エラーは `error: ...` の 1 行、警告は `warning: ...`、補足は `note: ...` |
-| 色 | 標準出力が端末のときだけ付く。パイプやリダイレクトでは付かない。`NO_COLOR` を設定すると端末でも付かない |
-| 作業フォルダ | `-C DIR` を付けると、そのフォルダで実行したのと同じ。付けなければカレントディレクトリ（親をたどってリポジトリを探す） |
-| 質問される操作 | `mig ai tidy`（`-y` が無く標準入力が端末のときだけ。端末でなければ案を表示して「re-run with --yes to apply」と出し、**何も変更せず終了コード 0**）、`mig h split -i`、`mig ai key`（キーを標準入力から読む） |
+| エラー・警告・シークレットの指摘 | 標準エラー出力です。エラーは `error: ...` の 1 行、警告は `warning: ...`、補足は `note: ...` の形です |
+| 色 | 標準出力が端末のときだけ付きます。パイプやリダイレクトでは付きません。`NO_COLOR` を設定すると、端末でも付きません |
+| 作業フォルダ | `-C DIR` を付けると、そのフォルダで実行したのと同じです。付けなければカレントディレクトリが対象で、親をたどってリポジトリを探します |
+| 質問される操作 | `mig ai tidy`（`-y` がなく標準入力が端末のときだけ。端末でなければ案を表示して「re-run with --yes to apply」と出し、**何も変更せず終了コード 0 で終わります**）、`mig h split -i`、`mig ai key`（キーを標準入力から読みます） |
 
-主な出力の形（行頭の空白は省略）:
+主な出力の形は次のとおりです（行頭の空白は省略しています）。
 
 ```text
 mig st      on main                         # 1 行目: ブランチ
@@ -414,7 +414,7 @@ mig save    saved 3523821 first
 mig diff    通常の unified diff
 ```
 
-シークレットの指摘は標準エラーに次の形で出る（`mig save` / `mig sync` / `mig st`）。
+シークレットの指摘は、標準エラーに次の形で出ます（`mig save` / `mig sync` / `mig st`）。
 
 ```text
 ⚠ 1 possible secret(s) found:
@@ -425,11 +425,11 @@ mig diff    通常の unified diff
 
 | 操作 | 戻し方 |
 |---|---|
-| `save` / `fold` / `reword` / `drop` / `split` / `absorb` / `ai tidy` / `agent finish` / `agent abort` / `sw` / `br` | `mig undo`（`mig op log` で履歴が見える）。未保存の変更があると止まる |
+| `save` / `fold` / `reword` / `drop` / `split` / `absorb` / `ai tidy` / `agent finish` / `agent abort` / `sw` / `br` | `mig undo`（`mig op log` で履歴を確認できます）。未保存の変更があると止まります |
 | `mig sync` | 手元の状態は `mig undo` で戻るが、**push 済みのものはリモートで戻らない** |
 | `agent abort` で捨てた作業 | `mig agent restore <ID>`（ID は abort 時に表示される `refs/mig/saved` のコミット） |
 | `mig undo --force` で捨てた未保存の変更 | 戻らない |
-| ファイルの直接編集・削除（mig を通さない変更） | `agent cp` を取っていればそこへ `mig agent restore N`。取っていなければ戻らない |
+| ファイルの直接編集・削除（mig を通さない変更） | `agent cp` を取っていれば、`mig agent restore N` で戻せます。取っていなければ戻りません |
 
 ### 6. コマンドのまとめ（エージェント向け）
 
@@ -437,7 +437,7 @@ mig diff    通常の unified diff
 |---|---|---|
 | 状態 | `mig st` | 副作用なし |
 | 履歴を見る | `mig log -n N` / `mig diff [REV]` | `REV` は `mig log` の番号、`@`（最新）、ハッシュ、ブランチ名 |
-| 全部コミット | `mig save -m "..."` | 変更が無いとエラー（終了コード 1）。`PATH…` で一部だけ |
+| 全部コミット | `mig save -m "..."` | 変更がないとエラー（終了コード 1）になります。`PATH…` で一部だけを対象にできます |
 | 区切りを残す | `mig agent cp -m "..."` | コミットを作らない |
 | 作業の開始・終了 | `mig agent start/finish/abort` | 上の「推奨ワークフロー」 |
 | シークレット確認 | `mig repo scan` | 見つかると終了コード 1 |
@@ -446,12 +446,12 @@ mig diff    通常の unified diff
 | ブランチ | `mig br new NAME` / `mig sw NAME` / `mig sw -c NAME` | |
 | 公開 | `mig sync` | **ユーザーの許可を得てから** |
 | 人間向けの要約を作る | `mig ai msg` / `mig ai explain [REV]` / `mig ai review [REV]` | AI の提供元とキーの設定が必要（無ければ `error: no API key ...`） |
-| 状況を AI に渡す | `mig context [--diff] [-f PATH]… [-n N]` | Markdown。シークレットは `[REDACTED]` |
+| 状況を AI に渡す | `mig context [--diff] [-f PATH]… [-n N]` | Markdown です。シークレットは `[REDACTED]` になります |
 
 ### 7. MCP サーバー
 
-`mig -C /path/to/repo mcp` を起動すると、標準入出力で MCP（JSON-RPC 2.0、1 行 1 メッセージ）を話す。標準出力にはプロトコルのメッセージしか出さない。
-登録例は人間向けガイドの「MCP サーバー」を参照。`initialize` の `instructions` には「`agent_start` → `checkpoint` → `agent_finish`（または `agent_abort`）の順で使うこと」と入れてある。
+`mig -C /path/to/repo mcp` を起動すると、標準入出力で MCP（JSON-RPC 2.0、1 行 1 メッセージ）を話します。標準出力には、プロトコルのメッセージしか出しません。
+登録例は、人間向けガイドの「MCP サーバー」を参照してください。`initialize` の `instructions` には、「`agent_start` → `checkpoint` → `agent_finish`（または `agent_abort`）の順で使うこと」と入れてあります。
 
 | ツール | 引数（必須は太字） | 返すもの |
 |---|---|---|
@@ -459,7 +459,7 @@ mig diff    通常の unified diff
 | `diff` | `rev`（省略時は未保存の変更） | unified diff（シークレットは `[REDACTED]`、長すぎる場合は途中で切る） |
 | `log` | `count`（1〜200、既定 20） | `番号 短縮ハッシュ 件名` の行 |
 | `context` | `diff`（真偽値）、`files`（パスの配列） | Markdown の概要（シークレットは `[REDACTED]`） |
-| `save` | **`message`** | `saved <ハッシュ>`。シークレットや巨大ファイルがあると、場所つきのエラーで拒否 |
+| `save` | **`message`** | `saved <ハッシュ>`。シークレットや巨大ファイルがあると、場所つきのエラーで拒否します |
 | `undo` | なし | `undid: <操作名>` |
 | `scan` | なし | 見つかったシークレットの一覧（値は伏せ字）、または `no secrets found` |
 | `agent_start` | `name` | セッションの開始メッセージ |
@@ -467,7 +467,7 @@ mig diff    通常の unified diff
 | `agent_finish` | **`message`** | 終了メッセージと新しい HEAD |
 | `agent_abort` | なし | 終了メッセージと、捨てた作業の保存先 |
 
-ツールの失敗は JSON-RPC のエラーではなく、結果の `isError: true` と本文のエラー文で返る。MCP からは push（`sync`）や `--force` は使えない。
+ツールの失敗は、JSON-RPC のエラーではなく、結果の `isError: true` と本文のエラー文で返ります。MCP からは、push（`sync`）も `--force` も使えません。
 
 ### 8. 状態の保存場所
 
@@ -475,19 +475,19 @@ mig diff    通常の unified diff
 |---|---|
 | `.git/mig/oplog.json` | undo / redo 用の操作ログ（最大 500 件） |
 | `.git/mig/agent.json` | 進行中のエージェントセッション |
-| `refs/mig/agent/start` / `base` / `cp` | セッション開始時の HEAD、開始時の作業ツリーのスナップショット、最新のチェックポイント。チェックポイントは `cp` から親をたどる |
+| `refs/mig/agent/start` / `base` / `cp` | セッション開始時の HEAD、開始時の作業ツリーのスナップショット、最新のチェックポイントです。チェックポイントは `cp` から親をたどって得られます |
 | `refs/mig/saved` | 直近に捨てた（`abort` / `restore` の前の）作業のスナップショット |
 | `.mig.toml`（リポジトリ直下） | `[editor]` `[save]` `[scan]` の設定 |
 | 設定フォルダの `mig/ai.toml` / `credentials.toml` / `settings.toml` / `recent.json` | AI の設定、API キー（自分だけが読める権限）、GUI の設定、最近開いたリポジトリ |
 
-`refs/mig/*` は push されない。`git gc` や他のツールが参照されていないオブジェクトを消さないよう、ref として残している。
+`refs/mig/*` は push されません。`git gc` や他のツールが、参照されていないオブジェクトを消さないよう、ref として残しています。
 
 ### 9. AI 連携で外に出る情報
 
-- AI への送信前に、シークレットらしい値（AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密鍵、`api_key = "..."` のような値）を `[REDACTED]` に置き換える。置き換えた数は標準エラーに `note:` で出る
-- それ以外の差分やファイルの中身は、選んだ提供元（`mig ai config` で確認）に送られる。長すぎる差分は 12 万バイトで切り、切ったことを AI に伝える
-- API キーは環境変数、なければ設定フォルダの `credentials.toml`。リポジトリには書かない
-- Anthropic にはサーバー側のフォールバック（`fallbacks: "default"`）を付けて送る。回答が拒否されたときは `error: the model declined this request: ...` で終わる
+- AI への送信前に、シークレットらしい値（AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密鍵、`api_key = "..."` のような値）を `[REDACTED]` に置き換えます。置き換えた数は、標準エラーに `note:` として出ます
+- それ以外の差分やファイルの中身は、選んだ提供元（`mig ai config` で確認できます）に送られます。長すぎる差分は 12 万バイトで切り、切ったことを AI に伝えます
+- API キーは、環境変数、なければ設定フォルダの `credentials.toml` から読みます。リポジトリには書きません
+- Anthropic には、サーバー側のフォールバック（`fallbacks: "default"`）を付けて送ります。回答が拒否されたときは、`error: the model declined this request: ...` で終わります
 
 ### 10. コードを読み書きする AI のために
 
@@ -498,11 +498,11 @@ cargo test
 cargo fmt && cargo clippy
 ```
 
-- Rust 2024、字下げは**スペース 2 つ**（`rustfmt.toml`）。コメントは必要最小限
-- GUI は `gui` フィーチャの後ろ。GUI 専用のモジュールには `#[cfg(feature = "gui")]` を付け、CLI のみのビルドで未使用の警告が出ないようにする
-- Git の操作は `git2`（libgit2）。`git` コマンドは呼ばない。git2 0.21 では `Commit::summary()` が `Result<Option<&str>>`、`message()` が `Result<&str>` など戻り値の形が古い資料と違うので、`repo::summary` / `repo::message` を使う
-- 履歴を変える操作は必ず `oplog::record(repo, "名前", || ...)` で包む。そうしないと `mig undo` で戻せない
-- GUI で時間のかかる処理は別スレッドで行い、スレッド内で `repo::open` し直す（`git2::Repository` はスレッド間で共有できない）
+- Rust 2024 で、字下げは**スペース 2 つ**です（`rustfmt.toml`）。コメントは必要最小限にします
+- GUI は `gui` フィーチャの後ろにあります。GUI 専用のモジュールには `#[cfg(feature = "gui")]` を付け、CLI のみのビルドで未使用の警告が出ないようにします
+- Git の操作は `git2`（libgit2）で行い、`git` コマンドは呼びません。git2 0.21 では、`Commit::summary()` が `Result<Option<&str>>`、`message()` が `Result<&str>` など、戻り値の形が古い資料と違うので、`repo::summary` と `repo::message` を使います
+- 履歴を変える操作は、必ず `oplog::record(repo, "名前", || ...)` で包みます。そうしないと `mig undo` で戻せません
+- GUI で時間のかかる処理は別スレッドで行い、スレッド内で `repo::open` し直します（`git2::Repository` はスレッド間で共有できません）
 
 | ファイル | 役割 |
 |---|---|
@@ -518,13 +518,13 @@ cargo fmt && cargo clippy
 | `agent.rs` / `mcp.rs` | エージェントセッション、MCP サーバー |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` | GUI（画面全体、エディタ、ビュワー、ようこそ画面、設定、AI まわり） |
 
-テストの流儀: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認している。`MIG_GITHUB_API` で GitHub API の向き先を変えられる。AI の向き先は `mig ai config --base-url` で変える。
+テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。
 
 ### 11. 既知の制限
 
-- `--json` 出力は無い（構造化データが必要なら MCP）
-- AI 機能と GitHub への作成は、本物のサービスでの動作確認がまだ。偽のサーバーでの確認のみ
-- `mig sync` の undo はリモートに及ばない
-- `absorb` は未 push のコミットだけが対象。push 済みの行を触った変更は作業ツリーに残る
-- `fold` / `drop` / `split` はマージコミットを扱えない
-- Windows と macOS では未確認（Linux で開発・確認している）
+- `--json` 出力はありません（構造化データが必要なら MCP を使ってください）
+- AI 機能と GitHub への作成は、本物のサービスでの動作確認がまだです。偽のサーバーでの確認のみです
+- `mig sync` の undo は、リモートには及びません
+- `absorb` の対象は、未 push のコミットだけです。push 済みの行を触った変更は、作業ツリーに残ります
+- `fold` / `drop` / `split` は、マージコミットを扱えません
+- Windows と macOS では未確認です（Linux で開発・確認しています）
