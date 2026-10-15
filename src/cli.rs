@@ -7,9 +7,11 @@ use chrono::{Local, TimeZone};
 use clap::{Args, Parser, Subcommand};
 use git2::{DiffFormat, DiffOptions, Oid, Repository};
 
+use crate::ai::AiConfig;
+use crate::assist::ContextOpts;
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, gc, oplog, ops, repo, rev, scan, setup, split};
+use crate::{absorb, agent, ai, assist, gc, oplog, ops, repo, rev, scan, setup, split};
 
 const HELP: &str = "\
 {about}
@@ -44,6 +46,20 @@ Operations (mig op):
 
 Repository (mig repo):
   init, gc, size, scan
+
+AI (mig ai):
+  msg                Suggest a commit message for the current changes (or: mig save --ai)
+  explain, review    Explain or review a commit or the current changes
+  tidy               Suggest how to fold recent commits, and apply it
+  config, key        Choose the provider and model, store an API key
+
+Agent sessions (mig agent):
+  start, cp, log, restore, finish, abort, status
+                     Checkpoint and squash (or throw away) an AI agent's work
+
+For AI tools:
+  context            Markdown overview of the repository, secrets redacted
+  mcp                Run as an MCP server over stdio
 
 GUI:
   gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
@@ -122,6 +138,26 @@ enum Cmd {
   Repo(RepoCmd),
   /// Open the GUI on the welcome screen; `mig gui here` (or a path) opens that folder's repository
   Gui { target: Option<PathBuf> },
+  /// AI helpers: commit messages, explanations, reviews and history tidying
+  #[command(subcommand)]
+  Ai(AiCmd),
+  /// Checkpoint an AI agent's work, then squash it into one commit or throw it away
+  #[command(subcommand)]
+  Agent(AgentCmd),
+  /// Print a Markdown overview of the repository for an AI chat (secrets are redacted)
+  Context {
+    /// Include the uncommitted diff
+    #[arg(long)]
+    diff: bool,
+    /// Include these files in full
+    #[arg(short, long = "file", value_name = "PATH")]
+    files: Vec<String>,
+    /// Number of recent commits to list
+    #[arg(short = 'n', default_value_t = 15)]
+    count: usize,
+  },
+  /// Run an MCP (Model Context Protocol) server on stdin/stdout for AI clients
+  Mcp,
 
   // Earlier top-level spellings, kept working but out of the help.
   #[command(hide = true)]
@@ -144,6 +180,76 @@ enum Cmd {
   Gc,
   #[command(hide = true)]
   Size(SizeArgs),
+}
+
+#[derive(Subcommand)]
+enum AiCmd {
+  /// Suggest a commit message for the uncommitted changes
+  Msg,
+  /// Explain a commit, or the uncommitted changes
+  Explain { rev: Option<String> },
+  /// Review a commit, or the uncommitted changes, for problems
+  Review { rev: Option<String> },
+  /// Suggest folding the latest unpushed commits into meaningful ones
+  Tidy {
+    /// How many recent commits to consider
+    #[arg(short = 'n', default_value_t = 20)]
+    count: usize,
+    /// Apply the plan without asking
+    #[arg(short, long)]
+    yes: bool,
+  },
+  /// Show or change the provider, model, base URL and answer language
+  Config {
+    #[arg(long)]
+    provider: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    /// Override the provider's endpoint (required for `custom`)
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Language for generated text, e.g. Japanese (empty for English)
+    #[arg(long)]
+    language: Option<String>,
+  },
+  /// Store an API key for a provider (read from stdin), or remove it with --clear
+  Key {
+    provider: String,
+    #[arg(long)]
+    clear: bool,
+  },
+  /// List the supported providers
+  Providers,
+}
+
+#[derive(Subcommand)]
+enum AgentCmd {
+  /// Snapshot the working tree and start a session
+  Start {
+    #[arg(default_value = "agent")]
+    name: String,
+  },
+  /// Checkpoint the working tree (no commit is made)
+  Cp {
+    #[arg(short, long, default_value = "checkpoint")]
+    message: String,
+  },
+  /// List the session's checkpoints
+  Log,
+  /// Bring the working tree back to a checkpoint (number from `log`, or an id)
+  Restore { checkpoint: String },
+  /// Squash everything since start into one commit and end the session
+  Finish {
+    #[arg(short, long)]
+    message: Option<String>,
+    /// Let the AI write the message
+    #[arg(long)]
+    ai: bool,
+  },
+  /// Throw away everything since start and end the session
+  Abort,
+  /// Show the current session
+  Status,
 }
 
 #[derive(Subcommand)]
@@ -222,6 +328,9 @@ struct SaveArgs {
   /// Commit even if secrets or large files are detected
   #[arg(long)]
   force: bool,
+  /// Let the AI write the message
+  #[arg(long)]
+  ai: bool,
   /// Limit to these paths
   paths: Vec<String>,
 }
@@ -369,10 +478,14 @@ enum Action {
   Scan,
   Gc,
   Size(usize),
+  Agent(AgentCmd),
+  Context(ContextOpts),
 }
 
 enum Top {
   Init(InitArgs),
+  Ai(AiCmd),
+  Mcp,
   #[cfg_attr(not(feature = "gui"), allow(dead_code))]
   Gui(Option<PathBuf>),
   Repo(Action),
@@ -384,6 +497,14 @@ impl Cmd {
     let a = match self {
       Cmd::Init(i) | Cmd::Repo(RepoCmd::Init(i)) => return Ok(Top::Init(i)),
       Cmd::Gui { target } => return Ok(Top::Gui(target)),
+      Cmd::Ai(a) => return Ok(Top::Ai(a)),
+      Cmd::Mcp => return Ok(Top::Mcp),
+      Cmd::Agent(a) => A::Agent(a),
+      Cmd::Context { diff, files, count } => A::Context(ContextOpts {
+        diff,
+        files,
+        commits: count,
+      }),
       Cmd::St => A::St,
       Cmd::Save(s) => A::Save(s),
       Cmd::Sync { force } => A::Sync(force),
@@ -523,6 +644,8 @@ pub fn run() -> Result<()> {
     }
     #[cfg(not(feature = "gui"))]
     Top::Gui(_) => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
+    Top::Ai(a) => return run_ai(&dir, a),
+    Top::Mcp => return crate::mcp::serve(&dir),
     Top::Repo(a) => a,
   };
 
@@ -558,7 +681,17 @@ pub fn run() -> Result<()> {
 fn dispatch(repo: &Repository, action: Action) -> Result<()> {
   match action {
     Action::St => status(repo),
-    Action::Save(SaveArgs { message, force, paths }) => {
+    Action::Save(SaveArgs {
+      mut message,
+      force,
+      ai,
+      paths,
+    }) => {
+      if ai && message.is_none() {
+        let r = assist::commit_message(repo, &AiConfig::load())?;
+        note_redacted(r.redacted);
+        message = Some(r.text);
+      }
       let saved = oplog::record(repo, "save", || ops::save(repo, message.as_deref(), &paths, force))?;
       for w in &saved.warnings {
         eprintln!("{} {w}", paint("33", "warning:"));
@@ -754,6 +887,13 @@ fn dispatch(repo: &Repository, action: Action) -> Result<()> {
     Action::RemoteRm(name) => {
       setup::remove_remote(repo, &name)?;
       println!("removed {name}");
+      Ok(())
+    }
+    Action::Agent(cmd) => run_agent(repo, cmd),
+    Action::Context(opts) => {
+      let (text, redacted) = assist::context(repo, &opts)?;
+      print!("{text}");
+      note_redacted(redacted);
       Ok(())
     }
     Action::Publish(p) => {
@@ -996,6 +1136,228 @@ fn init(
   }
   for n in &out.notes {
     eprintln!("{} {n}", paint("33", "note:"));
+  }
+  Ok(())
+}
+
+fn note_redacted(n: usize) {
+  if n > 0 {
+    eprintln!(
+      "{} {n} possible secret(s) were replaced with [REDACTED]",
+      paint("33", "note:")
+    );
+  }
+}
+
+fn run_ai(dir: &std::path::Path, cmd: AiCmd) -> Result<()> {
+  let mut cfg = AiConfig::load();
+  match cmd {
+    AiCmd::Providers => {
+      for p in ai::PROVIDERS {
+        let (_, src) = ai::find_key(p);
+        let key = match src {
+          ai::KeySource::Env(v) => format!("key from ${v}"),
+          ai::KeySource::Stored => "key stored".into(),
+          ai::KeySource::NotNeeded => "no key needed".into(),
+          ai::KeySource::Missing => format!("no key (set ${} or `mig ai key {}`)", p.key_env, p.id),
+        };
+        let mark = if p.id == cfg.provider {
+          paint("32", "*")
+        } else {
+          " ".into()
+        };
+        println!("{mark} {:<11} {:<26} {}", p.id, p.name, paint("2", &key));
+      }
+      Ok(())
+    }
+    AiCmd::Config {
+      provider,
+      model,
+      base_url,
+      language,
+    } => {
+      let changed = provider.is_some() || model.is_some() || base_url.is_some() || language.is_some();
+      if let Some(p) = provider {
+        ai::provider(&p)?;
+        if p != cfg.provider {
+          cfg.model.clear();
+          cfg.base_url.clear();
+        }
+        cfg.provider = p;
+      }
+      if let Some(m) = model {
+        cfg.model = m;
+      }
+      if let Some(u) = base_url {
+        cfg.base_url = u;
+      }
+      if let Some(l) = language {
+        cfg.language = l;
+      }
+      if changed {
+        cfg.save()?;
+      }
+      let p = cfg.provider()?;
+      println!("provider  {} ({})", p.id, p.name);
+      println!(
+        "model     {}",
+        cfg.model().unwrap_or_else(|e| paint("33", &e.to_string()))
+      );
+      println!(
+        "base url  {}",
+        cfg.base_url().unwrap_or_else(|e| paint("33", &e.to_string()))
+      );
+      println!(
+        "language  {}",
+        if cfg.language.is_empty() {
+          "English"
+        } else {
+          &cfg.language
+        }
+      );
+      let (_, src) = ai::find_key(p);
+      println!("api key   {src:?}");
+      Ok(())
+    }
+    AiCmd::Key { provider, clear } => {
+      ai::provider(&provider)?;
+      if clear {
+        ai::store_key(&provider, None)?;
+        println!("removed the stored key for {provider}");
+        return Ok(());
+      }
+      if std::io::stdin().is_terminal() {
+        eprint!("paste the API key for {provider} and press Enter: ");
+      }
+      let mut key = String::new();
+      std::io::stdin().read_line(&mut key)?;
+      if key.trim().is_empty() {
+        return Err(anyhow!("no key given"));
+      }
+      ai::store_key(&provider, Some(&key))?;
+      println!("stored (in your user config folder, readable only by you)");
+      Ok(())
+    }
+    AiCmd::Msg => {
+      let repo = repo::open(dir)?;
+      let r = assist::commit_message(&repo, &cfg)?;
+      note_redacted(r.redacted);
+      println!("{}", r.text);
+      Ok(())
+    }
+    AiCmd::Explain { rev } => {
+      let repo = repo::open(dir)?;
+      let r = assist::explain(&repo, &cfg, rev.as_deref())?;
+      note_redacted(r.redacted);
+      println!("{}", r.text);
+      Ok(())
+    }
+    AiCmd::Review { rev } => {
+      let repo = repo::open(dir)?;
+      let r = assist::review(&repo, &cfg, rev.as_deref())?;
+      note_redacted(r.redacted);
+      println!("{}", r.text);
+      Ok(())
+    }
+    AiCmd::Tidy { count, yes } => {
+      let repo = repo::open(dir)?;
+      let groups = assist::tidy_plan(&repo, &cfg, count)?;
+      if groups.is_empty() {
+        println!("the history already looks tidy");
+        return Ok(());
+      }
+      let chain = rev::chain(&repo, count)?;
+      for g in &groups {
+        println!(
+          "{}",
+          paint(
+            "1",
+            &format!("#{}..#{} -> {}", g.from, g.to, g.message.lines().next().unwrap_or(""))
+          )
+        );
+        for c in &chain[g.from - 1..g.to] {
+          println!("    {} {}", paint("33", &repo::short(c.id())), repo::summary(c));
+        }
+      }
+      if !yes {
+        if !std::io::stdin().is_terminal() {
+          println!("re-run with --yes to apply");
+          return Ok(());
+        }
+        print!("apply this plan? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut a = String::new();
+        std::io::stdin().read_line(&mut a)?;
+        if a.trim() != "y" {
+          println!("left as is");
+          return Ok(());
+        }
+      }
+      assist::apply_tidy(&repo, &groups)?;
+      println!("folded {} group(s); `mig undo` reverts it", groups.len());
+      Ok(())
+    }
+  }
+}
+
+fn run_agent(repo: &Repository, cmd: AgentCmd) -> Result<()> {
+  match cmd {
+    AgentCmd::Start { name } => {
+      let s = agent::start(repo, &name)?;
+      println!("agent session \"{}\" started on {}", s.name, s.branch);
+      println!("checkpoint with `mig agent cp`, end with `mig agent finish` or `mig agent abort`");
+    }
+    AgentCmd::Cp { message } => match agent::checkpoint(repo, &message)? {
+      Some(o) => println!("checkpoint {}", paint("33", &repo::short(o))),
+      None => println!("nothing changed since the last checkpoint"),
+    },
+    AgentCmd::Log => {
+      for (i, c) in agent::checkpoints(repo)?.iter().enumerate() {
+        println!(
+          "{:>4}  {}  {}  {}",
+          i + 1,
+          paint("33", &repo::short(c.oid)),
+          paint("2", &fmt_time(c.time)),
+          c.message
+        );
+      }
+    }
+    AgentCmd::Restore { checkpoint } => {
+      let o = agent::restore(repo, &checkpoint)?;
+      println!("working tree restored to {}", paint("33", &repo::short(o)));
+    }
+    AgentCmd::Finish { message, ai } => {
+      let f = agent::finish(repo, message.as_deref(), ai)?;
+      println!(
+        "session finished: {} commit(s) since start; HEAD is {}",
+        f.commits,
+        paint("33", &f.head.map(repo::short).unwrap_or_default())
+      );
+    }
+    AgentCmd::Abort => {
+      let saved = agent::abort(repo)?;
+      println!("session aborted; everything since start was discarded");
+      println!(
+        "the discarded work is kept as {}; `mig agent restore {}` brings it back",
+        paint("33", &repo::short(saved)),
+        repo::short(saved)
+      );
+    }
+    AgentCmd::Status => match agent::status(repo)? {
+      None => println!("no agent session"),
+      Some(s) => {
+        println!(
+          "session   {} (on {}, since {})",
+          s.session.name,
+          s.session.branch,
+          fmt_time(s.session.started)
+        );
+        println!(
+          "checkpoints {}, commits since start {}, changed files {}",
+          s.checkpoints, s.commits, s.changed_files
+        );
+      }
+    },
   }
   Ok(())
 }

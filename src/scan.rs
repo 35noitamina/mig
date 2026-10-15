@@ -149,6 +149,33 @@ pub fn scan_line(cfg: &Config, path: &str, lineno: usize, line: &str, out: &mut 
   }
 }
 
+// Replace anything that looks like a secret with a placeholder, e.g. before text leaves the
+// machine. Returns the redacted text and how many values were replaced.
+pub fn redact(text: &str) -> (String, usize) {
+  let mut count = 0;
+  let out: String = text
+    .split_inclusive('\n')
+    .map(|line| {
+      let mut l = line.to_string();
+      for rule in rules() {
+        let spans: Vec<_> = rule
+          .re
+          .captures_iter(&l)
+          .map(|c| c.name("s").unwrap_or_else(|| c.get(0).unwrap()))
+          .filter(|m| !rule.entropy || entropy(m.as_str()) >= 3.5)
+          .map(|m| m.range())
+          .collect();
+        for r in spans.into_iter().rev() {
+          l.replace_range(r, "[REDACTED]");
+          count += 1;
+        }
+      }
+      l
+    })
+    .collect();
+  (out, count)
+}
+
 pub fn scan_text(cfg: &Config, path: &str, text: &str, out: &mut Vec<Finding>) {
   if cfg.ignored(path) {
     return;
@@ -308,6 +335,13 @@ mod tests {
   fn generic_needs_entropy() {
     assert!(rules_hit("password = aaaaaaaaaaaaaaaaaaaa").is_empty());
     assert_eq!(rules_hit("api_key: \"Zx9fQ2pLm7Rt4KwB8nVy\""), vec!["Generic secret"]);
+  }
+
+  #[test]
+  fn redacts_secrets() {
+    let (out, n) = redact("a = 1\nkey = \"sk-ant-api03-abcdefghijklmnopqrstuvwxyz\"\nAKIAABCDEFGHIJKLMNOP\n");
+    assert_eq!(n, 2);
+    assert_eq!(out, "a = 1\nkey = \"[REDACTED]\"\n[REDACTED]\n");
   }
 
   #[test]

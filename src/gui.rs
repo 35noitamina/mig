@@ -8,13 +8,14 @@ use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
 use git2::{DiffOptions, Oid, Repository};
 
+use crate::aiui::AiPanel;
 use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
 use crate::settings::{self, Settings, SettingsDialog};
 use crate::welcome::{self, Opened, Welcome};
-use crate::{absorb, config, github, oplog, ops, repo, rev, scan, setup, split};
+use crate::{absorb, agent, config, github, oplog, ops, repo, rev, scan, setup, split};
 
 const HISTORY: usize = 300;
 const REFRESH: Duration = Duration::from_secs(3);
@@ -86,6 +87,8 @@ struct App {
   changed_lines: usize,
   auto_pending: bool,
   saving: Option<SaveJob>,
+  ai: AiPanel,
+  agent: Option<agent::Session>,
 }
 
 struct SaveJob {
@@ -347,6 +350,8 @@ impl App {
     let repo = repo::open(dir)?;
     let root = repo.workdir().unwrap_or(dir).to_path_buf();
     let cfg = config::load_dir(&root).unwrap_or_default();
+    let agent = agent::session(&repo);
+    let ai = AiPanel::new(root.clone(), ctx.clone());
     let mut editor = Editor::new(root.clone());
     (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
     let mut app = App {
@@ -383,6 +388,8 @@ impl App {
       changed_lines: 0,
       auto_pending: false,
       saving: None,
+      ai,
+      agent,
     };
     app.refresh();
     Ok(app)
@@ -397,6 +404,7 @@ impl App {
   // Starts a background refresh; results are applied by poll_refresh as they arrive.
   fn refresh(&mut self) {
     self.last_refresh = Instant::now();
+    self.agent = agent::session(&self.repo);
     if self.loading.is_some() {
       self.refresh_again = true;
       return;
@@ -710,6 +718,16 @@ impl App {
           });
           ui.close();
         }
+        if ui
+          .add_enabled(self.ai.busy().is_none(), egui::Button::new("Copy context for AI"))
+          .on_hover_text(
+            "Copy a Markdown overview of this repository (with the diff, secrets redacted) to paste into an AI chat",
+          )
+          .clicked()
+        {
+          self.ai.copy_context();
+          ui.close();
+        }
         ui.separator();
         match setup::remotes(&self.repo) {
           Ok(list) if !list.is_empty() => {
@@ -722,6 +740,13 @@ impl App {
           }
         }
       });
+      let agent_label = match &self.agent {
+        Some(a) => RichText::new(format!("Agent: {}", a.name)).color(Color32::from_rgb(140, 180, 230)),
+        None => RichText::new("Agent"),
+      };
+      ui.menu_button(agent_label, |ui| self.agent_menu(ui))
+        .response
+        .on_hover_text("Checkpoint an AI agent's work, then squash it or throw it away");
       if ui
         .button("Settings")
         .on_hover_text("Appearance, commit identity and this repository's options")
@@ -740,6 +765,21 @@ impl App {
           .hint_text("commit message (optional)")
           .desired_width(260.0),
       );
+      if ui
+        .add_enabled(
+          self.ai.busy().is_none() && !self.changes.is_empty(),
+          egui::Button::new("AI"),
+        )
+        .on_hover_text("Let the AI write a commit message from the current changes")
+        .on_disabled_hover_text("Needs uncommitted changes and no other AI request running")
+        .clicked()
+      {
+        if let Err(e) = self.editor.save_all() {
+          self.status = Err(e);
+        } else {
+          self.ai.commit_message();
+        }
+      }
       let dirty = self.editor.tabs.iter().any(|t| t.dirty());
       if ui
         .add_enabled(
@@ -821,14 +861,31 @@ impl App {
 
   fn sidebar(&mut self, ui: &mut egui::Ui) {
     let changes_label = format!("Changes ({})", self.changes.len());
-    if ui
-      .selectable_label(self.view == View::Changes, RichText::new(changes_label).strong())
-      .clicked()
-    {
-      self.view = View::Changes;
-      self.selected.clear();
-      self.load_diff();
-    }
+    ui.horizontal(|ui| {
+      if ui
+        .selectable_label(self.view == View::Changes, RichText::new(changes_label).strong())
+        .clicked()
+      {
+        self.view = View::Changes;
+        self.selected.clear();
+        self.load_diff();
+      }
+      let can = self.ai.busy().is_none() && !self.changes.is_empty();
+      if ui
+        .add_enabled(can, egui::Button::new("Explain").small())
+        .on_hover_text("Ask the AI what the uncommitted changes do")
+        .clicked()
+      {
+        self.ai.explain(None, false);
+      }
+      if ui
+        .add_enabled(can, egui::Button::new("Review").small())
+        .on_hover_text("Ask the AI to look for problems in the uncommitted changes")
+        .clicked()
+      {
+        self.ai.explain(None, true);
+      }
+    });
     egui::ScrollArea::vertical()
       .id_salt("changes")
       .max_height(180.0)
@@ -861,6 +918,16 @@ impl App {
       {
         self.fold_selected();
       }
+      if ui
+        .add_enabled(
+          self.ai.busy().is_none() && self.rows.len() >= 2,
+          egui::Button::new("AI tidy"),
+        )
+        .on_hover_text("Ask the AI how to fold recent unpushed commits into meaningful ones")
+        .clicked()
+      {
+        self.ai.tidy();
+      }
     });
     ui.label(
       RichText::new("Ctrl/Cmd-click or Shift-click to select several; right-click for more")
@@ -884,6 +951,12 @@ impl App {
             ("Split…", "split", "Split this commit in two by file"),
             ("Fold into parent", "fold", "Combine this commit with the one before it"),
             ("Drop", "drop", "Remove this commit from history"),
+            ("Explain (AI)", "explain", "Ask the AI what this commit does"),
+            (
+              "Review (AI)",
+              "review",
+              "Ask the AI to look for problems in this commit",
+            ),
           ] {
             if ui.button(name).on_hover_text(tip).clicked() {
               action = Some((key, i));
@@ -933,7 +1006,58 @@ impl App {
         self.fold_selected();
       }
       Some(("drop", i)) => self.drop_commit(i),
+      Some(("explain", i)) => self.ai.explain(Some((i + 1).to_string()), false),
+      Some(("review", i)) => self.ai.explain(Some((i + 1).to_string()), true),
       _ => {}
+    }
+  }
+
+  fn agent_menu(&mut self, ui: &mut egui::Ui) {
+    if self.agent.is_none() {
+      if ui
+        .button("Start session")
+        .on_hover_text("Snapshot the working tree before an AI agent starts working")
+        .clicked()
+      {
+        let r = agent::start(&self.repo, "gui").map(|s| format!("agent session started on {}", s.branch));
+        self.done(r);
+        ui.close();
+      }
+      return;
+    }
+    if ui
+      .button("Checkpoint")
+      .on_hover_text("Snapshot the working tree now (no commit)")
+      .clicked()
+    {
+      let r = agent::checkpoint(&self.repo, "checkpoint").map(|o| match o {
+        Some(o) => format!("checkpoint {}", repo::short(o)),
+        None => "nothing changed since the last checkpoint".into(),
+      });
+      self.done(r);
+      ui.close();
+    }
+    if ui
+      .button("Finish…")
+      .on_hover_text("Squash everything since the start into one commit")
+      .clicked()
+    {
+      if let Err(e) = self.editor.save_all() {
+        self.status = Err(e);
+      } else {
+        self.ai.open_finish();
+      }
+      ui.close();
+    }
+    if ui
+      .button(RichText::new("Abort").color(Color32::from_rgb(230, 110, 110)))
+      .on_hover_text("Throw away everything since the start (kept recoverable with `mig agent restore`)")
+      .clicked()
+    {
+      let r =
+        agent::abort(&self.repo).map(|o| format!("agent session aborted; discarded work kept as {}", repo::short(o)));
+      self.done(r);
+      ui.close();
     }
   }
 
@@ -987,6 +1111,13 @@ impl App {
 
   fn dialogs(&mut self, ctx: &egui::Context) {
     self.publish_dialog(ctx);
+    if let Some((r, changed)) = self.ai.windows(ctx, &self.repo) {
+      if changed {
+        self.selected.clear();
+        self.view = View::Changes;
+      }
+      self.done(r.map_err(|e| anyhow::anyhow!(e)));
+    }
     if let Some(d) = &mut self.settings {
       match d.ui(ctx) {
         settings::Outcome::Open => {}
@@ -1165,6 +1296,14 @@ impl App {
       self.refresh();
     }
     self.poll_check(&ctx);
+    match self.ai.poll() {
+      Some(Ok(s)) => self.done(Ok(s)),
+      Some(Err(e)) => self.status = Err(e),
+      None => {}
+    }
+    if let Some(m) = self.ai.message_out.take() {
+      self.message = m;
+    }
     ctx.request_repaint_after(
       if self.editor.checking() || self.editor.running() || self.saving.is_some() {
         Duration::from_millis(200)

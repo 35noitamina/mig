@@ -22,7 +22,7 @@ pub struct Plan {
 }
 
 // Commits that may be rewritten: unpushed, first-parent, no merges. Maps id -> position.
-fn mutable(repo: &Repository, chain: &[Commit<'_>]) -> Result<HashMap<Oid, usize>> {
+pub(crate) fn mutable(repo: &Repository, chain: &[Commit<'_>]) -> Result<HashMap<Oid, usize>> {
   let up = repo::upstream(repo);
   let mut out = HashMap::new();
   for (i, c) in chain.iter().enumerate() {

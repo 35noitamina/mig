@@ -7,6 +7,7 @@ git 互換のバージョン管理ツール。中身は普通の `.git` なの�
 - どんな操作も `mig undo` で取り消せる
 - API キーや巨大ファイルのうっかりコミット／push を防ぐ
 - ネイティブ GUI（エディタ・実行・自動コミット付き）
+- AI 連携：コミットメッセージ、説明・レビュー、履歴の整理、AI エージェント作業の巻き戻し、MCP サーバー（Anthropic / OpenAI / OpenRouter / Gemini など各社に対応）
 
 ---
 
@@ -117,6 +118,37 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 | `mig repo gc` | オブジェクトをデルタ圧縮した pack にまとめ、不要なファイルを削除 |
 | `mig repo size [-n N]` | リポジトリの容量と、履歴中の大きいファイル |
 
+### AI — `mig ai`
+
+| コマンド | 内容 |
+|---|---|
+| `mig ai msg` | 未保存の変更からコミットメッセージを提案（`mig save --ai` ならそのままコミット） |
+| `mig ai explain [REV]` | コミット（省略時は未保存の変更）が何をしているか説明 |
+| `mig ai review [REV]` | コミット（省略時は未保存の変更）の問題点をレビュー |
+| `mig ai tidy [-n N] [-y]` | 最近の未 push コミットを意味のまとまりで fold する案を出し、確認して適用（`mig undo` で戻せる） |
+| `mig ai config [--provider P] [--model M] [--base-url URL] [--language L]` | 使う AI の設定（引数なしで現在の設定を表示） |
+| `mig ai key PROVIDER` / `--clear` | API キーを標準入力から保存／削除 |
+| `mig ai providers` | 対応している提供元とキーの状態 |
+
+### AI エージェントのセッション — `mig agent`
+
+| コマンド | 内容 |
+|---|---|
+| `mig agent start [NAME]` | 今の作業ツリーを記録してセッション開始 |
+| `mig agent cp [-m MSG]` | チェックポイント（コミットはしない） |
+| `mig agent log` | チェックポイント一覧 |
+| `mig agent restore N` | 作業ツリーをチェックポイント N（または ID）の状態に戻す |
+| `mig agent finish [-m MSG] [--ai]` | 開始以降の作業を 1 つのコミットにまとめて終了 |
+| `mig agent abort` | 開始以降の作業（ファイルもエージェントのコミットも）を捨てて終了 |
+| `mig agent status` | セッションの状態 |
+
+### AI ツール向け
+
+| コマンド | 内容 |
+|---|---|
+| `mig context [--diff] [-f PATH…] [-n N]` | リポジトリの概要を Markdown で出力（AI のチャットに貼る用、シークレットは伏せ字） |
+| `mig mcp` | MCP サーバーとして起動（下記） |
+
 ### GUI
 
 | コマンド | 内容 |
@@ -201,6 +233,62 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 
 ---
 
+## AI 連携
+
+### 提供元
+
+| `--provider` | 提供元 | API の形式 | キーの環境変数 |
+|---|---|---|---|
+| `anthropic` | Anthropic | Messages API | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI | Chat Completions | `OPENAI_API_KEY` |
+| `openrouter` | OpenRouter | Chat Completions | `OPENROUTER_API_KEY` |
+| `gemini` | Google Gemini（OpenAI 互換エンドポイント） | Chat Completions | `GEMINI_API_KEY` |
+| `groq` | Groq | Chat Completions | `GROQ_API_KEY` |
+| `mistral` | Mistral | Chat Completions | `MISTRAL_API_KEY` |
+| `deepseek` | DeepSeek | Chat Completions | `DEEPSEEK_API_KEY` |
+| `xai` | xAI | Chat Completions | `XAI_API_KEY` |
+| `ollama` | Ollama（ローカル） | Chat Completions | 不要 |
+| `custom` | その他の OpenAI 互換 API（`--base-url` 必須） | Chat Completions | 任意 |
+
+```sh
+mig ai config --provider openrouter --model anthropic/claude-sonnet-5-5 --language Japanese
+mig ai key openrouter        # キーを貼り付けて Enter
+mig ai msg
+```
+
+- モデルの初期値は Anthropic のみ（`claude-opus-5-5`）。ほかの提供元はモデル名の指定が必要
+- キーは環境変数を優先し、なければ `mig ai key` / GUI で保存したもの（設定フォルダの `credentials.toml`、自分だけが読める権限）を使う。リポジトリには保存しない
+- **送信前に、シークレットらしい値はすべて `[REDACTED]` に置き換える**（置き換えた数を表示）。それ以外の差分やファイルの中身は選んだ提供元に送られる
+- 長すぎる差分は途中で切り、切ったことを AI にも伝える
+- 設定は設定フォルダの `mig/ai.toml`。GUI では Settings → AI（Test ボタンで疎通確認できる）
+
+GUI では、ツールバーの **AI**（コミットメッセージ）、History の **Explain** / **Review** / **AI tidy**、コミットの右クリック、**Agent** メニュー、Repo メニューの **Copy context for AI** から使える。
+
+### エージェントのセッション
+
+Claude Code などの AI エージェントに作業を任せる前に `mig agent start` しておくと、
+
+- エージェントの作業中も `mig agent cp` で細かく状態を残せる（ブランチやコミット履歴は汚さない）
+- 終わったら `mig agent finish` で 1 つのきれいなコミットに（`--ai` でメッセージも AI が書く）
+- 気に入らなければ `mig agent abort` で開始前の状態に戻る。捨てた作業も `mig agent restore <ID>` で取り戻せる
+
+状態は `refs/mig/agent/*` と `.git/mig/agent.json` に保存され、push されない。
+
+### MCP サーバー
+
+`mig mcp` は MCP（Model Context Protocol）サーバーとして標準入出力で動く。AI クライアントの設定に次のように登録する（パスは自分のリポジトリに置き換える）。
+
+```json
+{
+  "mcpServers": {
+    "mig": { "command": "mig", "args": ["-C", "/path/to/repo", "mcp"] }
+  }
+}
+```
+
+使えるツール: `status`、`diff`、`log`、`context`、`save`、`undo`、`scan`、`agent_start`、`checkpoint`、`agent_finish`、`agent_abort`。
+`save` はシークレットや巨大ファイルがあると拒否し、`diff` / `context` の出力はシークレットを伏せ字にする。
+
 ## 設定
 
 GUI の **Settings**（ようこそ画面では下の **Settings…**）から変更できる。
@@ -210,6 +298,7 @@ GUI の **Settings**（ようこそ画面では下の **Settings…**）から�
 | Appearance | テーマ（ダーク／ライト／OS に合わせる、初期値はダーク）、画面の拡大率、コードの文字サイズ | 設定フォルダの `mig/settings.toml` |
 | Identity | コミットの作者名とメールアドレス | git のグローバル設定 |
 | This repository | 自動コミットの行数、チェック・実行コマンド、ファイルサイズの上限、シークレット検出の除外パスと許可リスト | リポジトリの `.mig.toml` |
+| AI | 提供元、モデル、ベース URL、回答の言語、API キー、疎通テスト | 設定フォルダの `mig/ai.toml` と `mig/credentials.toml` |
 | GitHub | トークンが見つかるかの確認 | — |
 
 `.mig.toml` は手で書いてもよい。GUI から保存したときは、変更した項目だけを書き換えてコメントは残す。

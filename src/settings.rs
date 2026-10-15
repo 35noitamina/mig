@@ -5,6 +5,9 @@ use eframe::egui::{self, Color32, FontId, RichText, TextStyle, ThemePreference};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{self, CONFIG_FILE};
+use std::sync::mpsc::{self, Receiver};
+
+use crate::ai::{self, AiConfig};
 use crate::github;
 
 // App-wide preferences, kept in the user's config folder.
@@ -185,7 +188,15 @@ enum Tab {
   Appearance,
   Identity,
   Repository,
+  Ai,
   GitHub,
+}
+
+struct AiFields {
+  config: AiConfig,
+  key: String,
+  test: Option<Receiver<Result<String, String>>>,
+  test_result: Option<Result<String, String>>,
 }
 
 pub struct SettingsDialog {
@@ -197,6 +208,7 @@ pub struct SettingsDialog {
   // (root, edited fields, fields as loaded)
   repo: Option<(PathBuf, RepoFields, RepoFields)>,
   token_ok: bool,
+  ai: AiFields,
   error: Option<String>,
 }
 
@@ -225,6 +237,12 @@ impl SettingsDialog {
       local_identity,
       repo: root.map(|r| (r.to_path_buf(), RepoFields::load(r), RepoFields::load(r))),
       token_ok: github::token().is_some(),
+      ai: AiFields {
+        config: AiConfig::load(),
+        key: String::new(),
+        test: None,
+        test_result: None,
+      },
       error: None,
     }
   }
@@ -240,6 +258,11 @@ impl SettingsDialog {
     }
     if let Some((root, fields, orig)) = &self.repo {
       fields.save(root, orig)?;
+    }
+    self.ai.config.save()?;
+    if !self.ai.key.trim().is_empty() {
+      ai::store_key(&self.ai.config.provider, Some(&self.ai.key))?;
+      self.ai.key.clear();
     }
     Ok(())
   }
@@ -258,6 +281,7 @@ impl SettingsDialog {
             (Tab::Appearance, "Appearance"),
             (Tab::Identity, "Identity"),
             (Tab::Repository, "This repository"),
+            (Tab::Ai, "AI"),
             (Tab::GitHub, "GitHub"),
           ] {
             if tab == Tab::Repository && self.repo.is_none() {
@@ -274,6 +298,7 @@ impl SettingsDialog {
             Tab::Appearance => self.appearance(ui),
             Tab::Identity => self.identity(ui),
             Tab::Repository => self.repository(ui),
+            Tab::Ai => self.ai_tab(ui),
             Tab::GitHub => self.github(ui),
           }
         });
@@ -428,6 +453,157 @@ impl SettingsDialog {
         );
         ui.end_row();
       });
+  }
+
+  fn ai_tab(&mut self, ui: &mut egui::Ui) {
+    let f = &mut self.ai;
+    if let Some(rx) = &f.test
+      && let Ok(r) = rx.try_recv()
+    {
+      f.test_result = Some(r);
+      f.test = None;
+    }
+    let before = f.config.provider.clone();
+    egui::Grid::new("ai")
+      .num_columns(2)
+      .spacing([24.0, 10.0])
+      .show(ui, |ui| {
+        ui.label("Provider");
+        let current = ai::provider(&f.config.provider).map(|p| p.name).unwrap_or("?");
+        egui::ComboBox::from_id_salt("provider")
+          .selected_text(current)
+          .show_ui(ui, |ui| {
+            for p in ai::PROVIDERS {
+              ui.selectable_value(&mut f.config.provider, p.id.to_string(), p.name);
+            }
+          });
+        ui.end_row();
+        let p = ai::provider(&f.config.provider).ok();
+        ui.label("Model");
+        let hint = p
+          .and_then(|p| p.default_model)
+          .unwrap_or("required, e.g. as listed by the provider");
+        ui.add(
+          egui::TextEdit::singleline(&mut f.config.model)
+            .hint_text(hint)
+            .desired_width(340.0),
+        );
+        ui.end_row();
+        ui.label("Base URL");
+        let hint = p
+          .map(|p| p.base_url)
+          .filter(|u| !u.is_empty())
+          .unwrap_or("required for this provider");
+        ui.add(
+          egui::TextEdit::singleline(&mut f.config.base_url)
+            .hint_text(hint)
+            .desired_width(340.0),
+        );
+        ui.end_row();
+        ui.label("Answer language");
+        ui.add(
+          egui::TextEdit::singleline(&mut f.config.language)
+            .hint_text("English")
+            .desired_width(160.0),
+        );
+        ui.end_row();
+        ui.label("API key");
+        ui.vertical(|ui| {
+          ui.add(
+            egui::TextEdit::singleline(&mut f.key)
+              .password(true)
+              .hint_text("paste a new key to store it")
+              .desired_width(340.0),
+          );
+          if let Some(p) = p {
+            let (_, src) = ai::find_key(p);
+            let (text, color) = match src {
+              ai::KeySource::Env(v) => (format!("using ${v}"), Color32::from_rgb(110, 200, 110)),
+              ai::KeySource::Stored => (
+                "a key is stored for this provider".into(),
+                Color32::from_rgb(110, 200, 110),
+              ),
+              ai::KeySource::NotNeeded => ("no key needed".into(), Color32::GRAY),
+              ai::KeySource::Missing => (
+                format!("no key yet (paste one, or set ${})", p.key_env),
+                Color32::from_rgb(230, 170, 80),
+              ),
+            };
+            ui.horizontal(|ui| {
+              ui.label(RichText::new(text).color(color).small());
+              if src == ai::KeySource::Stored
+                && ui
+                  .small_button("Remove")
+                  .on_hover_text("Delete the stored key")
+                  .clicked()
+                && let Err(e) = ai::store_key(p.id, None)
+              {
+                self.error = Some(format!("{e:#}"));
+              }
+            });
+          }
+        });
+        ui.end_row();
+      });
+    if f.config.provider != before {
+      f.config.model.clear();
+      f.config.base_url.clear();
+    }
+    ui.add_space(6.0);
+    ui.label(
+      RichText::new(
+        "Keys are kept in your user config folder (credentials.toml), never in the repository. \
+         Before anything is sent, values that look like secrets are replaced with [REDACTED].",
+      )
+      .weak()
+      .small(),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+      if ui
+        .add_enabled(f.test.is_none(), egui::Button::new("Test"))
+        .on_hover_text("Save these settings and send a tiny request to check they work")
+        .clicked()
+      {
+        let saved = f.config.save().and_then(|_| {
+          if f.key.trim().is_empty() {
+            Ok(())
+          } else {
+            ai::store_key(&f.config.provider, Some(&f.key))
+          }
+        });
+        match saved {
+          Err(e) => f.test_result = Some(Err(format!("{e:#}"))),
+          Ok(()) => {
+            f.key.clear();
+            let (tx, rx) = mpsc::channel();
+            let cfg = f.config.clone();
+            let ctx = ui.ctx().clone();
+            std::thread::spawn(move || {
+              let r = ai::ask(&cfg, "Reply with the single word OK.", "Say OK.")
+                .map(|r| format!("works: {}", r.text.chars().take(60).collect::<String>()))
+                .map_err(|e| format!("{e:#}"));
+              let _ = tx.send(r);
+              ctx.request_repaint();
+            });
+            f.test = Some(rx);
+            f.test_result = None;
+          }
+        }
+      }
+      if f.test.is_some() {
+        ui.spinner();
+      }
+      match &f.test_result {
+        Some(Ok(t)) => {
+          ui.label(RichText::new(t).color(Color32::from_rgb(110, 200, 110)));
+        }
+        Some(Err(e)) => {
+          ui.label(RichText::new(e).color(Color32::from_rgb(230, 100, 100)));
+        }
+        None => {}
+      }
+    });
   }
 
   fn github(&mut self, ui: &mut egui::Ui) {

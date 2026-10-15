@@ -1,4 +1,9 @@
 mod absorb;
+mod agent;
+mod ai;
+#[cfg(feature = "gui")]
+mod aiui;
+mod assist;
 mod cli;
 mod config;
 #[cfg(feature = "gui")]
@@ -8,6 +13,7 @@ mod github;
 mod guard;
 #[cfg(feature = "gui")]
 mod gui;
+mod mcp;
 mod oplog;
 mod ops;
 mod patch;
