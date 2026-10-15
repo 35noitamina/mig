@@ -154,8 +154,8 @@ enum Cmd {
     #[arg(short = 'n', default_value_t = 10)]
     count: usize,
   },
-  /// Open the GUI
-  Gui,
+  /// Open the GUI on the welcome screen; `mig gui here` (or a path) opens that folder's repository
+  Gui { target: Option<PathBuf> },
 }
 
 #[derive(Subcommand)]
@@ -232,9 +232,18 @@ pub fn run() -> Result<()> {
       );
     }
     #[cfg(feature = "gui")]
-    Cmd::Gui => return crate::gui::run(dir),
+    Cmd::Gui { target } => {
+      let open = target.map(|t| {
+        if t.as_os_str() == "here" {
+          dir.clone()
+        } else {
+          dir.join(t)
+        }
+      });
+      return crate::gui::run(dir, open);
+    }
     #[cfg(not(feature = "gui"))]
-    Cmd::Gui => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
+    Cmd::Gui { .. } => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
     _ => {}
   }
 
@@ -478,7 +487,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       println!("removed {name}");
       Ok(())
     }
-    Cmd::Init { .. } | Cmd::Gui => unreachable!(),
+    Cmd::Init { .. } | Cmd::Gui { .. } => unreachable!(),
   }
 }
 

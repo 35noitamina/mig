@@ -12,6 +12,7 @@ use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
+use crate::settings::{self, Settings, SettingsDialog};
 use crate::welcome::{self, Opened, Welcome};
 use crate::{absorb, config, github, oplog, ops, repo, rev, scan, setup, split};
 
@@ -56,6 +57,7 @@ struct App {
   root: PathBuf,
   leave: bool,
   publish: Option<PublishDialog>,
+  settings: Option<SettingsDialog>,
   mode: Mode,
   editor: Editor,
   auto_lines: usize,
@@ -189,9 +191,21 @@ fn diff_lines(d: &git2::Diff<'_>, max: usize) -> Vec<(Color32, String)> {
   out
 }
 
-// Start in `dir` if it is inside a repository, otherwise on the welcome screen.
-pub fn run(dir: PathBuf) -> Result<()> {
-  let start = repo::open(&dir).ok().and_then(|r| r.workdir().map(|w| w.to_path_buf()));
+// Plain `mig gui` starts on the welcome screen; with `open` it goes straight to that
+// folder's repository, falling back to the welcome screen when there is none.
+pub fn run(dir: PathBuf, open: Option<PathBuf>) -> Result<()> {
+  let start = open
+    .as_ref()
+    .and_then(|p| repo::open(p).ok())
+    .and_then(|r| r.workdir().map(|w| w.to_path_buf()));
+  let note = match (&open, &start) {
+    (Some(p), None) => Some(format!(
+      "{} is not a repository yet. Use \"Set up this folder…\" to make it one.",
+      p.display()
+    )),
+    _ => None,
+  };
+  let dir = open.unwrap_or(dir);
   let opts = eframe::NativeOptions {
     viewport: egui::ViewportBuilder::default()
       .with_title("mig")
@@ -203,10 +217,10 @@ pub fn run(dir: PathBuf) -> Result<()> {
     opts,
     Box::new(move |cc| {
       load_cjk_font(&cc.egui_ctx);
-      cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
+      Settings::load().apply(&cc.egui_ctx);
       let mut shell = Shell {
         app: None,
-        welcome: Welcome::new(Some(dir), None),
+        welcome: Welcome::new(Some(dir), None).with_info(note),
       };
       if let Some(root) = start {
         shell.open(
@@ -339,6 +353,7 @@ impl App {
       root,
       leave: false,
       publish: None,
+      settings: None,
       mode: Mode::Editor,
       editor,
       auto_lines: cfg.editor.auto_commit_lines,
@@ -370,6 +385,12 @@ impl App {
     };
     app.refresh();
     Ok(app)
+  }
+
+  fn reload_config(&mut self) {
+    let cfg = config::load_dir(&self.root).unwrap_or_default();
+    self.auto_lines = cfg.editor.auto_commit_lines;
+    (self.editor.check_cmd, self.editor.run_cmd) = config::commands(&self.root, &cfg.editor);
   }
 
   // Starts a background refresh; results are applied by poll_refresh as they arrive.
@@ -694,6 +715,9 @@ impl App {
           }
         }
       });
+      if ui.button("Settings").clicked() {
+        self.settings = Some(SettingsDialog::new(Some(&self.root)));
+      }
       ui.separator();
       ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
       ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
@@ -929,6 +953,18 @@ impl App {
 
   fn dialogs(&mut self, ctx: &egui::Context) {
     self.publish_dialog(ctx);
+    if let Some(d) = &mut self.settings {
+      match d.ui(ctx) {
+        settings::Outcome::Open => {}
+        settings::Outcome::Closed => self.settings = None,
+        settings::Outcome::Saved => {
+          self.settings = None;
+          self.reload_config();
+          self.status = Ok("settings saved".into());
+          self.refresh();
+        }
+      }
+    }
     if let Some(blocked) = self.confirm_save.take() {
       let mut keep = true;
       let mut force = false;

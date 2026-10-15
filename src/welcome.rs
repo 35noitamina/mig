@@ -5,6 +5,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use crate::config::Kind;
 use crate::guard::{self, SaveBlocked};
+use crate::settings::{self, SettingsDialog};
 use crate::setup::{self, CreateOptions, GithubOptions, Outcome, Preview};
 use crate::{config, github, repo};
 
@@ -101,8 +102,10 @@ pub struct Welcome {
   path: String,
   name: String,
   error: Option<String>,
+  info: Option<String>,
   recent: Vec<PathBuf>,
   init: Option<InitDialog>,
+  settings: Option<SettingsDialog>,
 }
 
 impl Welcome {
@@ -112,12 +115,19 @@ impl Welcome {
       .map(|p| p.display().to_string())
       .unwrap_or_default();
     Welcome {
+      info: None,
       path,
       name: String::new(),
       error,
       recent: load_recent(),
       init: None,
+      settings: None,
     }
+  }
+
+  pub fn with_info(mut self, info: Option<String>) -> Welcome {
+    self.info = info;
+    self
   }
 
   fn dir(&self) -> PathBuf {
@@ -224,6 +234,14 @@ impl Welcome {
     if let Some(e) = &self.error {
       notice(ui, ERROR, e);
     }
+    if let Some(i) = &self.info {
+      notice(ui, INFO, i);
+    }
+    if let Some(d) = &mut self.settings
+      && !matches!(d.ui(ui.ctx()), settings::Outcome::Open)
+    {
+      self.settings = None;
+    }
     if !self.recent.is_empty() {
       card(ui, "Recent", |ui| {
         for p in self.recent.clone() {
@@ -244,6 +262,11 @@ impl Welcome {
         }
       });
     }
+    ui.vertical_centered(|ui| {
+      if ui.add(secondary("Settings…")).clicked() {
+        self.settings = Some(SettingsDialog::new(None));
+      }
+    });
     opened
   }
 

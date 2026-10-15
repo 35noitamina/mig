@@ -14,6 +14,8 @@ mod patch;
 mod repo;
 mod rev;
 mod scan;
+#[cfg(feature = "gui")]
+mod settings;
 mod setup;
 mod split;
 #[cfg(feature = "gui")]
