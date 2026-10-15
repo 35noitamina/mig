@@ -4,15 +4,62 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use chrono::{Local, TimeZone};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use git2::{DiffFormat, DiffOptions, Oid, Repository};
 
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
 use crate::{absorb, gc, oplog, ops, repo, rev, scan, setup, split};
 
+const HELP: &str = "\
+{about}
+
+{usage-heading} {usage}
+
+Daily:
+  st                 Show changed files
+  save               Commit every change (no staging needed)
+  sync               Fetch, rebase onto upstream and push
+  log                Show history; the numbers work as revisions
+  diff               Show uncommitted changes, or the changes of a commit
+  undo, redo         Undo or redo the last operation
+  sw                 Switch branch (-c to create it)
+
+History (mig history | mig h):
+  fold               Fold commits into one
+  reword             Change a commit message
+  drop               Remove a commit
+  split              Split a commit in two
+  absorb             Move edits into the commits that last touched those lines
+  log, diff          Same as the daily commands
+
+Branches (mig branch | mig br):
+  list, new, rm, switch
+
+Remotes (mig remote):
+  list, add, rm, publish (create the repository on GitHub and push)
+
+Operations (mig op):
+  undo, redo, log
+
+Repository (mig repo):
+  init, gc, size, scan
+
+GUI:
+  gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
+
+Run `mig <group> --help` or `mig <group> <command> --help` for details.
+
+Options:
+{options}";
+
 #[derive(Parser)]
-#[command(name = "mig", version, about = "A friendlier, git-compatible version control tool")]
+#[command(
+  name = "mig",
+  version,
+  about = "A friendlier, git-compatible version control tool",
+  help_template = HELP
+)]
 struct Cli {
   /// Run as if started in <DIR>
   #[arg(short = 'C', global = true, value_name = "DIR")]
@@ -23,148 +70,389 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-  /// Create a repository in a new or existing folder
-  Init {
-    path: Option<PathBuf>,
-    /// Make the first commit too
-    #[arg(long)]
-    save: bool,
-    /// Message for the first commit
-    #[arg(short, long)]
-    message: Option<String>,
-    /// Commit even if secrets or large files are found
-    #[arg(long)]
-    force: bool,
-    /// Add this URL as origin
-    #[arg(long, value_name = "URL")]
-    remote: Option<String>,
-    /// Also create the repository on GitHub ([OWNER/]NAME, defaults to the folder name) and push
-    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
-    github: Option<String>,
-    /// Make the GitHub repository private
-    #[arg(long)]
-    private: bool,
-    /// Use the SSH URL for the GitHub remote
-    #[arg(long)]
-    ssh: bool,
-    /// Don't create a .gitignore
-    #[arg(long)]
-    no_ignore: bool,
-  },
-  /// List, add or remove remotes
-  Remote {
-    #[command(subcommand)]
-    cmd: Option<RemoteCmd>,
-  },
   /// Show changed files
   #[command(alias = "status")]
   St,
   /// Commit every change (no staging needed)
-  Save {
-    #[arg(short, long)]
-    message: Option<String>,
-    /// Commit even if secrets or large files are detected
-    #[arg(long)]
-    force: bool,
-    /// Limit to these paths
-    paths: Vec<String>,
-  },
-  /// Show history; numbers can be used as revisions
-  Log {
-    #[arg(short = 'n', default_value_t = 20)]
-    count: usize,
-  },
-  /// Show uncommitted changes, or the changes of a commit
-  Diff { rev: Option<String> },
-  /// Fold commits into one: `fold 2..5`, `fold 3` (into its parent), `fold` (1 into 2)
-  Fold {
-    range: Option<String>,
-    #[arg(short, long)]
-    message: Option<String>,
-  },
-  /// Change a commit message
-  Reword {
-    rev: String,
-    #[arg(short, long)]
-    message: String,
-  },
-  /// Remove a commit from history
-  Drop { rev: String },
-  /// Move uncommitted edits into the unpushed commits that last touched those lines
-  Absorb {
-    /// Only show where each change would go
-    #[arg(short = 'n', long)]
-    dry_run: bool,
-  },
-  /// Split a commit in two: the given paths (or hunks picked with -i) go first
-  Split {
-    rev: String,
-    paths: Vec<String>,
-    /// Pick hunks interactively
-    #[arg(short)]
-    i: bool,
-    /// Message for the first commit
-    #[arg(short, long)]
-    message: Option<String>,
-  },
-  /// Undo the last operation
-  Undo {
-    /// Discard unsaved changes
-    #[arg(long)]
-    force: bool,
-  },
-  /// Redo an undone operation
-  Redo {
-    #[arg(long)]
-    force: bool,
-  },
-  /// Show the operation log
-  Oplog {
-    #[arg(short = 'n', default_value_t = 20)]
-    count: usize,
-  },
-  /// List, create (`br NAME [AT]`) or delete (`br -d NAME`) branches
-  #[command(alias = "branch")]
-  Br {
-    name: Option<String>,
-    at: Option<String>,
-    #[arg(short)]
-    d: bool,
-  },
-  /// Switch branch
-  #[command(alias = "switch")]
-  Sw {
-    name: String,
-    /// Create the branch first
-    #[arg(short)]
-    c: bool,
-  },
+  Save(SaveArgs),
   /// Fetch, rebase onto upstream and push
   Sync {
     /// Push even if secrets are detected
     #[arg(long)]
     force: bool,
   },
-  /// Scan the working tree for API keys and other secrets
-  Scan,
-  /// Pack objects with delta compression and remove redundant files
-  Gc,
-  /// Show repository size and the largest files in history
-  Size {
-    #[arg(short = 'n', default_value_t = 10)]
-    count: usize,
+  /// Show history; numbers can be used as revisions
+  Log(LogArgs),
+  /// Show uncommitted changes, or the changes of a commit
+  Diff(DiffArgs),
+  /// Undo the last operation
+  Undo(ForceArgs),
+  /// Redo an undone operation
+  Redo(ForceArgs),
+  /// Switch branch
+  #[command(alias = "switch")]
+  Sw(SwitchArgs),
+
+  /// Look at and rewrite history
+  #[command(visible_alias = "h", subcommand)]
+  History(HistoryCmd),
+  /// List, create, delete and switch branches
+  #[command(visible_alias = "br", args_conflicts_with_subcommands = true)]
+  Branch {
+    #[command(subcommand)]
+    cmd: Option<BranchCmd>,
+    // Older `mig br NAME [AT]` / `mig br -d NAME` forms.
+    #[arg(hide = true)]
+    name: Option<String>,
+    #[arg(hide = true)]
+    at: Option<String>,
+    #[arg(short, hide = true)]
+    d: bool,
   },
+  /// Manage remotes and publish to GitHub
+  Remote {
+    #[command(subcommand)]
+    cmd: Option<RemoteCmd>,
+  },
+  /// Undo, redo and the operation log
+  #[command(subcommand)]
+  Op(OpCmd),
+  /// Create, tidy up and inspect the repository
+  #[command(subcommand)]
+  Repo(RepoCmd),
   /// Open the GUI on the welcome screen; `mig gui here` (or a path) opens that folder's repository
   Gui { target: Option<PathBuf> },
+
+  // Earlier top-level spellings, kept working but out of the help.
+  #[command(hide = true)]
+  Init(InitArgs),
+  #[command(hide = true)]
+  Fold(FoldArgs),
+  #[command(hide = true)]
+  Reword(RewordArgs),
+  #[command(hide = true)]
+  Drop(RevArgs),
+  #[command(hide = true)]
+  Absorb(AbsorbArgs),
+  #[command(hide = true)]
+  Split(SplitArgs),
+  #[command(hide = true)]
+  Oplog(CountArgs),
+  #[command(hide = true)]
+  Scan,
+  #[command(hide = true)]
+  Gc,
+  #[command(hide = true)]
+  Size(SizeArgs),
+}
+
+#[derive(Subcommand)]
+enum HistoryCmd {
+  /// Show history; numbers can be used as revisions
+  Log(LogArgs),
+  /// Show uncommitted changes, or the changes of a commit
+  Diff(DiffArgs),
+  /// Fold commits into one: `fold 2..5`, `fold 3` (into its parent), `fold` (1 into 2)
+  Fold(FoldArgs),
+  /// Change a commit message
+  Reword(RewordArgs),
+  /// Remove a commit from history
+  Drop(RevArgs),
+  /// Split a commit in two: the given paths (or hunks picked with -i) go first
+  Split(SplitArgs),
+  /// Move uncommitted edits into the unpushed commits that last touched those lines
+  Absorb(AbsorbArgs),
+}
+
+#[derive(Subcommand)]
+enum BranchCmd {
+  /// List branches
+  #[command(alias = "ls")]
+  List,
+  /// Create a branch at HEAD or at REV
+  New { name: String, at: Option<String> },
+  /// Delete a branch
+  #[command(alias = "delete")]
+  Rm { name: String },
+  /// Switch to a branch
+  #[command(alias = "sw")]
+  Switch(SwitchArgs),
 }
 
 #[derive(Subcommand)]
 enum RemoteCmd {
+  /// List remotes
+  #[command(alias = "ls")]
+  List,
   /// Add a remote
   Add { name: String, url: String },
   /// Remove a remote
   #[command(alias = "remove")]
   Rm { name: String },
+  /// Create this repository on GitHub, add it as origin and push
+  Publish(PublishArgs),
+}
+
+#[derive(Subcommand)]
+enum OpCmd {
+  /// Undo the last operation
+  Undo(ForceArgs),
+  /// Redo an undone operation
+  Redo(ForceArgs),
+  /// Show the operation log
+  Log(CountArgs),
+}
+
+#[derive(Subcommand)]
+enum RepoCmd {
+  /// Create a repository in a new or existing folder
+  Init(InitArgs),
+  /// Pack objects with delta compression and remove redundant files
+  Gc,
+  /// Show repository size and the largest files in history
+  Size(SizeArgs),
+  /// Scan the working tree for API keys and other secrets
+  Scan,
+}
+
+#[derive(Args)]
+struct SaveArgs {
+  #[arg(short, long)]
+  message: Option<String>,
+  /// Commit even if secrets or large files are detected
+  #[arg(long)]
+  force: bool,
+  /// Limit to these paths
+  paths: Vec<String>,
+}
+
+#[derive(Args)]
+struct LogArgs {
+  #[arg(short = 'n', default_value_t = 20)]
+  count: usize,
+}
+
+#[derive(Args)]
+struct CountArgs {
+  #[arg(short = 'n', default_value_t = 20)]
+  count: usize,
+}
+
+#[derive(Args)]
+struct SizeArgs {
+  #[arg(short = 'n', default_value_t = 10)]
+  count: usize,
+}
+
+#[derive(Args)]
+struct DiffArgs {
+  rev: Option<String>,
+}
+
+#[derive(Args)]
+struct ForceArgs {
+  /// Discard unsaved changes
+  #[arg(long)]
+  force: bool,
+}
+
+#[derive(Args)]
+struct SwitchArgs {
+  name: String,
+  /// Create the branch first
+  #[arg(short)]
+  c: bool,
+}
+
+#[derive(Args)]
+struct FoldArgs {
+  range: Option<String>,
+  #[arg(short, long)]
+  message: Option<String>,
+}
+
+#[derive(Args)]
+struct RewordArgs {
+  rev: String,
+  #[arg(short, long)]
+  message: String,
+}
+
+#[derive(Args)]
+struct RevArgs {
+  rev: String,
+}
+
+#[derive(Args)]
+struct AbsorbArgs {
+  /// Only show where each change would go
+  #[arg(short = 'n', long)]
+  dry_run: bool,
+}
+
+#[derive(Args)]
+struct SplitArgs {
+  rev: String,
+  paths: Vec<String>,
+  /// Pick hunks interactively
+  #[arg(short)]
+  i: bool,
+  /// Message for the first commit
+  #[arg(short, long)]
+  message: Option<String>,
+}
+
+#[derive(Args)]
+struct PublishArgs {
+  /// [OWNER/]NAME on GitHub; defaults to the folder name
+  name: Option<String>,
+  /// Make the repository private
+  #[arg(long)]
+  private: bool,
+  /// Use the SSH URL for origin
+  #[arg(long)]
+  ssh: bool,
+}
+
+#[derive(Args)]
+struct InitArgs {
+  path: Option<PathBuf>,
+  /// Make the first commit too
+  #[arg(long)]
+  save: bool,
+  /// Message for the first commit
+  #[arg(short, long)]
+  message: Option<String>,
+  /// Commit even if secrets or large files are found
+  #[arg(long)]
+  force: bool,
+  /// Add this URL as origin
+  #[arg(long, value_name = "URL")]
+  remote: Option<String>,
+  /// Also create the repository on GitHub ([OWNER/]NAME, defaults to the folder name) and push
+  #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+  github: Option<String>,
+  /// Make the GitHub repository private
+  #[arg(long)]
+  private: bool,
+  /// Use the SSH URL for the GitHub remote
+  #[arg(long)]
+  ssh: bool,
+  /// Don't create a .gitignore
+  #[arg(long)]
+  no_ignore: bool,
+}
+
+// Every command, whichever group or spelling it was reached through.
+enum Action {
+  St,
+  Save(SaveArgs),
+  Sync(bool),
+  Log(usize),
+  Diff(Option<String>),
+  Undo(bool),
+  Redo(bool),
+  OpLog(usize),
+  Fold(FoldArgs),
+  Reword(RewordArgs),
+  Drop(String),
+  Split(SplitArgs),
+  Absorb(bool),
+  BranchList,
+  BranchNew(String, Option<String>),
+  BranchRm(String),
+  Switch(SwitchArgs),
+  RemoteList,
+  RemoteAdd(String, String),
+  RemoteRm(String),
+  Publish(PublishArgs),
+  Scan,
+  Gc,
+  Size(usize),
+}
+
+enum Top {
+  Init(InitArgs),
+  Gui(Option<PathBuf>),
+  Repo(Action),
+}
+
+impl Cmd {
+  fn flatten(self) -> Result<Top> {
+    use Action as A;
+    let a = match self {
+      Cmd::Init(i) | Cmd::Repo(RepoCmd::Init(i)) => return Ok(Top::Init(i)),
+      Cmd::Gui { target } => return Ok(Top::Gui(target)),
+      Cmd::St => A::St,
+      Cmd::Save(s) => A::Save(s),
+      Cmd::Sync { force } => A::Sync(force),
+      Cmd::Log(l) | Cmd::History(HistoryCmd::Log(l)) => A::Log(l.count),
+      Cmd::Diff(d) | Cmd::History(HistoryCmd::Diff(d)) => A::Diff(d.rev),
+      Cmd::Undo(f) | Cmd::Op(OpCmd::Undo(f)) => A::Undo(f.force),
+      Cmd::Redo(f) | Cmd::Op(OpCmd::Redo(f)) => A::Redo(f.force),
+      Cmd::Oplog(c) | Cmd::Op(OpCmd::Log(c)) => A::OpLog(c.count),
+      Cmd::Fold(f) | Cmd::History(HistoryCmd::Fold(f)) => A::Fold(f),
+      Cmd::Reword(r) | Cmd::History(HistoryCmd::Reword(r)) => A::Reword(r),
+      Cmd::Drop(r) | Cmd::History(HistoryCmd::Drop(r)) => A::Drop(r.rev),
+      Cmd::Split(s) | Cmd::History(HistoryCmd::Split(s)) => A::Split(s),
+      Cmd::Absorb(a) | Cmd::History(HistoryCmd::Absorb(a)) => A::Absorb(a.dry_run),
+      Cmd::Sw(s)
+      | Cmd::Branch {
+        cmd: Some(BranchCmd::Switch(s)),
+        ..
+      } => A::Switch(s),
+      Cmd::Branch {
+        cmd: Some(BranchCmd::List),
+        ..
+      } => A::BranchList,
+      Cmd::Branch {
+        cmd: Some(BranchCmd::New { name, at }),
+        ..
+      } => A::BranchNew(name, at),
+      Cmd::Branch {
+        cmd: Some(BranchCmd::Rm { name }),
+        ..
+      } => A::BranchRm(name),
+      Cmd::Branch {
+        cmd: None,
+        name: None,
+        d: true,
+        ..
+      } => return Err(anyhow!("`-d` needs a branch name")),
+      Cmd::Branch {
+        cmd: None, name: None, ..
+      } => A::BranchList,
+      Cmd::Branch {
+        cmd: None,
+        name: Some(n),
+        d: true,
+        ..
+      } => A::BranchRm(n),
+      Cmd::Branch {
+        cmd: None,
+        name: Some(n),
+        at,
+        ..
+      } => A::BranchNew(n, at),
+      Cmd::Remote { cmd: None }
+      | Cmd::Remote {
+        cmd: Some(RemoteCmd::List),
+      } => A::RemoteList,
+      Cmd::Remote {
+        cmd: Some(RemoteCmd::Add { name, url }),
+      } => A::RemoteAdd(name, url),
+      Cmd::Remote {
+        cmd: Some(RemoteCmd::Rm { name }),
+      } => A::RemoteRm(name),
+      Cmd::Remote {
+        cmd: Some(RemoteCmd::Publish(p)),
+      } => A::Publish(p),
+      Cmd::Scan | Cmd::Repo(RepoCmd::Scan) => A::Scan,
+      Cmd::Gc | Cmd::Repo(RepoCmd::Gc) => A::Gc,
+      Cmd::Size(s) | Cmd::Repo(RepoCmd::Size(s)) => A::Size(s.count),
+    };
+    Ok(Top::Repo(a))
+  }
 }
 
 fn color() -> bool {
@@ -207,32 +495,22 @@ pub fn run() -> Result<()> {
     Some(d) => d,
     None => std::env::current_dir()?,
   };
-  match cli.cmd {
-    Cmd::Init {
-      path,
-      save,
-      message,
-      force,
-      remote,
-      github,
-      private,
-      ssh,
-      no_ignore,
-    } => {
+  let action = match cli.cmd.flatten()? {
+    Top::Init(i) => {
       return init(
-        dir.join(path.unwrap_or_default()),
-        save,
-        message,
-        force,
-        remote,
-        github,
-        private,
-        ssh,
-        no_ignore,
+        dir.join(i.path.unwrap_or_default()),
+        i.save,
+        i.message,
+        i.force,
+        i.remote,
+        i.github,
+        i.private,
+        i.ssh,
+        i.no_ignore,
       );
     }
     #[cfg(feature = "gui")]
-    Cmd::Gui { target } => {
+    Top::Gui(target) => {
       let open = target.map(|t| {
         if t.as_os_str() == "here" {
           dir.clone()
@@ -243,12 +521,12 @@ pub fn run() -> Result<()> {
       return crate::gui::run(dir, open);
     }
     #[cfg(not(feature = "gui"))]
-    Cmd::Gui { .. } => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
-    _ => {}
-  }
+    Top::Gui(_) => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
+    Top::Repo(a) => a,
+  };
 
   let repo = repo::open(&dir)?;
-  let result = dispatch(&repo, cli.cmd);
+  let result = dispatch(&repo, action);
   if let Err(e) = &result {
     if let Some(SecretsFound(found)) = e.downcast_ref::<SecretsFound>() {
       print_findings(found);
@@ -276,10 +554,10 @@ pub fn run() -> Result<()> {
   result
 }
 
-fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
-  match cmd {
-    Cmd::St => status(repo),
-    Cmd::Save { message, force, paths } => {
+fn dispatch(repo: &Repository, action: Action) -> Result<()> {
+  match action {
+    Action::St => status(repo),
+    Action::Save(SaveArgs { message, force, paths }) => {
       let saved = oplog::record(repo, "save", || ops::save(repo, message.as_deref(), &paths, force))?;
       for w in &saved.warnings {
         eprintln!("{} {w}", paint("33", "warning:"));
@@ -288,9 +566,9 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       println!("saved {} {}", paint("33", &repo::short(saved.oid)), repo::summary(&c));
       Ok(())
     }
-    Cmd::Log { count } => log(repo, count),
-    Cmd::Diff { rev } => diff(repo, rev.as_deref()),
-    Cmd::Fold { range, message } => {
+    Action::Log(count) => log(repo, count),
+    Action::Diff(rev) => diff(repo, rev.as_deref()),
+    Action::Fold(FoldArgs { range, message }) => {
       let (newer, older) = match range.as_deref() {
         None => (0, 1),
         Some(r) if r.contains("..") => rev::range(repo, r)?,
@@ -309,7 +587,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       );
       Ok(())
     }
-    Cmd::Reword { rev, message } => {
+    Action::Reword(RewordArgs { rev, message }) => {
       let pos = rev::position(repo, &rev)?;
       oplog::record(repo, &format!("reword {}", pos + 1), || {
         ops::reword(repo, pos, &message)
@@ -317,14 +595,14 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       println!("reworded #{}", pos + 1);
       Ok(())
     }
-    Cmd::Drop { rev } => {
+    Action::Drop(rev) => {
       let pos = rev::position(repo, &rev)?;
       let summary = repo::summary(&rev::resolve(repo, &rev)?);
       oplog::record(repo, &format!("drop {}", pos + 1), || ops::drop_commit(repo, pos))?;
       println!("dropped \"{summary}\"");
       Ok(())
     }
-    Cmd::Absorb { dry_run } => {
+    Action::Absorb(dry_run) => {
       let plan = if dry_run {
         absorb::absorb(repo, true)?
       } else {
@@ -347,7 +625,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       );
       Ok(())
     }
-    Cmd::Split { rev, paths, i, message } => {
+    Action::Split(SplitArgs { rev, paths, i, message }) => {
       let pos = rev::position(repo, &rev)?;
       let tip = oplog::record(repo, &format!("split {}", pos + 1), || {
         if i {
@@ -361,7 +639,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       println!("split #{}; HEAD is now {}", pos + 1, paint("33", &repo::short(tip)));
       Ok(())
     }
-    Cmd::Undo { force } => {
+    Action::Undo(force) => {
       let op = oplog::undo(repo, force)?;
       println!("undid: {}", op.cmd);
       if op.cmd == "sync" {
@@ -369,12 +647,12 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
-    Cmd::Redo { force } => {
+    Action::Redo(force) => {
       let op = oplog::redo(repo, force)?;
       println!("redid: {}", op.cmd);
       Ok(())
     }
-    Cmd::Oplog { count } => {
+    Action::OpLog(count) => {
       let log = oplog::load(repo)?;
       for (i, op) in log.ops.iter().enumerate().rev().take(count) {
         let undone = if i >= log.pos {
@@ -386,7 +664,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
-    Cmd::Br { name: None, .. } => {
+    Action::BranchList => {
       for b in ops::branches(repo)? {
         let mark = if b.current { paint("32", "*") } else { " ".into() };
         let name = if b.current { paint("32", &b.name) } else { b.name };
@@ -394,30 +672,24 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
-    Cmd::Br {
-      name: Some(name),
-      d: true,
-      ..
-    } => {
+    Action::BranchRm(name) => {
       oplog::record(repo, &format!("br -d {name}"), || ops::branch_delete(repo, &name))?;
       println!("deleted branch {name}");
       Ok(())
     }
-    Cmd::Br {
-      name: Some(name), at, ..
-    } => {
+    Action::BranchNew(name, at) => {
       oplog::record(repo, &format!("br {name}"), || {
         ops::branch_create(repo, &name, at.as_deref())
       })?;
       println!("created branch {name}");
       Ok(())
     }
-    Cmd::Sw { name, c } => {
+    Action::Switch(SwitchArgs { name, c }) => {
       oplog::record(repo, &format!("sw {name}"), || ops::switch(repo, &name, c))?;
       println!("switched to {name}");
       Ok(())
     }
-    Cmd::Sync { force } => {
+    Action::Sync(force) => {
       let r = oplog::record(repo, "sync", || ops::sync(repo, force))?;
       if r.fast_forwarded {
         println!("fast-forwarded to {}/{}", r.remote, r.branch);
@@ -432,7 +704,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
-    Cmd::Scan => {
+    Action::Scan => {
       let found = scan::scan_worktree(repo)?;
       if found.is_empty() {
         println!("{}", paint("32", "no secrets found"));
@@ -442,7 +714,7 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
         Err(anyhow!("secrets found"))
       }
     }
-    Cmd::Gc => {
+    Action::Gc => {
       let r = gc::gc(repo)?;
       println!(
         "packed {} objects, removed {} loose object(s) and {} old pack(s): {} -> {}",
@@ -454,12 +726,12 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       );
       Ok(())
     }
-    Cmd::Size { count } => {
+    Action::Size(count) => {
       let r = gc::size(repo, count)?;
       println!("loose objects: {} ({})", r.loose_count, guard::fmt_size(r.loose_bytes));
       println!("packs:         {} ({})", r.pack_count, guard::fmt_size(r.pack_bytes));
       if r.loose_count > 0 {
-        println!("{}", paint("2", "run `mig gc` to pack loose objects"));
+        println!("{}", paint("2", "run `mig repo gc` to pack loose objects"));
       }
       println!("\nlargest files in history (uncompressed):");
       for (path, size) in r.largest {
@@ -467,27 +739,39 @@ fn dispatch(repo: &Repository, cmd: Cmd) -> Result<()> {
       }
       Ok(())
     }
-    Cmd::Remote { cmd: None } => {
+    Action::RemoteList => {
       for (name, url) in setup::remotes(repo)? {
         println!("{name}  {url}");
       }
       Ok(())
     }
-    Cmd::Remote {
-      cmd: Some(RemoteCmd::Add { name, url }),
-    } => {
+    Action::RemoteAdd(name, url) => {
       setup::add_remote(repo, &name, &url)?;
       println!("added {name}");
       Ok(())
     }
-    Cmd::Remote {
-      cmd: Some(RemoteCmd::Rm { name }),
-    } => {
+    Action::RemoteRm(name) => {
       setup::remove_remote(repo, &name)?;
       println!("removed {name}");
       Ok(())
     }
-    Cmd::Init { .. } | Cmd::Gui { .. } => unreachable!(),
+    Action::Publish(p) => {
+      let gh = setup::GithubOptions {
+        name: p
+          .name
+          .unwrap_or_else(|| repo.workdir().map(setup::default_name).unwrap_or_default()),
+        private: p.private,
+        ssh: p.ssh,
+      };
+      let created = setup::create_github(repo, &gh)?;
+      println!("created {} on GitHub: {}", created.full_name, created.html_url);
+      match setup::push_initial(repo, false) {
+        Ok(0) => println!("nothing to push yet; run `mig save` then `mig sync`"),
+        Ok(n) => println!("pushed {n} commit(s)"),
+        Err(e) => eprintln!("{} {e}", paint("33", "note:")),
+      }
+      Ok(())
+    }
   }
 }
 
