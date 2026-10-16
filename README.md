@@ -1,12 +1,11 @@
 # mig
 
-git 互換のバージョン管理ツールです。中身は普通の `.git` なので、git や GitHub とそのまま併用できます。
+migはgit互換のバージョン管理ツールです。(mig insn't git)
 
-- ステージングは不要です。`mig save` で変更をまとめてコミットします
-- 履歴の編集が簡単です（統合・分割・削除・メッセージ修正・absorb）
+- 履歴の編集が簡単です（統合・分割・削除・メッセージ修正）
 - どんな操作も `mig undo` で取り消せます
-- API キーや巨大ファイルのうっかりコミット／push を防ぎます
-- ネイティブ GUI を備えています（エディタ・実行・自動コミット付き）
+- API キーなどを自動検知してコミットを停止します。
+- ネイティブ GUI を備えています(DataBaseやバイナリも対応)
 - AI 連携に対応しています：コミットメッセージ、説明・レビュー、履歴の整理、AI エージェント作業の巻き戻し、MCP サーバー（Anthropic / OpenAI / OpenRouter / Gemini など各社に対応）
 
 このドキュメントは 2 部構成です。
@@ -21,16 +20,8 @@ git 互換のバージョン管理ツールです。中身は普通の `.git` �
 ## 人間向けガイド
 
 
-### インストール
+### 必要用件
 
-[Rust](https://rustup.rs) を入れてから、次を実行します。
-
-```sh
-git clone https://github.com/35noitamina/mig
-cd mig
-cargo install --path .                        # GUI 付き
-cargo install --path . --no-default-features  # CLI のみ（軽い）
-```
 
 | OS | 事前に必要なもの |
 |---|---|
@@ -38,19 +29,11 @@ cargo install --path . --no-default-features  # CLI のみ（軽い）
 | macOS | `xcode-select --install`、`brew install openssl@3` |
 | Linux | `build-essential pkg-config libssl-dev`、GUI 用に `libxkbcommon-x11-0` と OpenGL ドライバ |
 
-コミットの作者情報を一度だけ設定しておきます（GUI の Settings → Identity からでも設定できます）。
+
+### 使い方
 
 ```sh
-git config --global user.name "名前"
-git config --global user.email "you@example.com"
-```
-
----
-
-### はじめかた
-
-```sh
-# 既存のフォルダをリポジトリにして、最初のコミットと GitHub への push まで
+# 既存のフォルダをリポジトリにし、最初のコミットと GitHub への push まで
 cd my-project
 mig repo init --save --github --private
 
@@ -76,8 +59,8 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 | コマンド | 内容 |
 |---|---|
 | `mig st` | 変更されたファイルの一覧（シークレットが含まれていれば警告） |
-| `mig save [-m MSG] [PATH…]` | 変更を全部コミットします。メッセージを省略すると自動で付きます |
-| `mig sync` | fetch → 自分のコミットを最新の上に付け直し → push |
+| `mig save [-m MSG] [PATH…]` | 変更を全部コミットします。 |
+| `mig sync` | fetch → 自分のコミットを最新の上に付け直しをし、pushします。 |
 | `mig log [-n N]` | 番号付きの履歴（1 が最新） |
 | `mig diff [REV]` | 未保存の差分、または指定コミットの差分 |
 | `mig undo` / `mig redo` | 直前の操作の取り消し／やり直し |
