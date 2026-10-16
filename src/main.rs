@@ -37,6 +37,7 @@ mod split;
 mod viewer;
 #[cfg(feature = "gui")]
 mod welcome;
+mod workspace;
 
 fn main() {
   if let Err(e) = cli::run() {

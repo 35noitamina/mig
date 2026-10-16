@@ -1,7 +1,7 @@
 // A Model Context Protocol server over stdio (newline-delimited JSON-RPC 2.0), so AI clients can
 // use mig as a set of tools. Only protocol messages go to stdout.
 use std::io::{BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use git2::Repository;
@@ -9,11 +9,17 @@ use serde_json::{Value, json};
 
 use crate::assist::{self, ContextOpts};
 use crate::guard::SaveBlocked;
-use crate::{agent, ai, files, oplog, ops, repo, rev, scan};
+use crate::{agent, ai, files, oplog, ops, repo, rev, scan, workspace};
 
 const MAX_DIFF: usize = 100_000;
 
-fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> Value {
+fn tool(name: &str, description: &str, mut properties: Value, required: &[&str]) -> Value {
+  if name != "repos" {
+    properties["repo"] = json!({
+      "type": "string",
+      "description": "Folder to work in, by name from `repos` (default: the folder the server started in, or the only open one)"
+    });
+  }
   json!({
     "name": name,
     "description": description,
@@ -24,6 +30,12 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 fn tools() -> Vec<Value> {
   let none = json!({});
   vec![
+    tool(
+      "repos",
+      "List the folders this server may work in (the ones open in the mig window, plus the folder it started in), with branch and running agent sessions.",
+      json!({}),
+      &[],
+    ),
     tool(
       "ls",
       "List a folder inside the repository, honouring .gitignore. Shows sizes and change marks (M modified, A added, ? untracked).",
@@ -303,33 +315,96 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
   }
 }
 
-fn handle(dir: &Path, msg: &Value) -> std::result::Result<Value, (i64, String)> {
-  let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
-  let params = msg.get("params").cloned().unwrap_or(Value::Null);
-  match method {
-    "initialize" => Ok(json!({
-      "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-      "capabilities": {"tools": {}},
-      "serverInfo": {"name": "mig", "version": env!("CARGO_PKG_VERSION")},
-      "instructions": "Version control and file tools for this repository. Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.",
-    })),
-    "ping" => Ok(json!({})),
-    "tools/list" => Ok(json!({"tools": tools()})),
-    "tools/call" => {
-      let name = params.get("name").and_then(Value::as_str).unwrap_or("");
-      let args = params.get("arguments").cloned().unwrap_or(json!({}));
-      let r = repo::open(dir).and_then(|repo| run_tool(&repo, name, &args));
-      let (text, is_error) = match r {
-        Ok(t) => (t, false),
-        Err(e) => (format!("{e:#}"), true),
-      };
-      Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+// One per connection: the folder the server started in.
+struct Server {
+  launch: Option<PathBuf>,
+}
+
+impl Server {
+  fn repos(&self) -> String {
+    let mut out = String::new();
+    let mut list = workspace::load();
+    if let Some(l) = &self.launch
+      && !list.iter().any(|w| workspace::same(&w.path, l))
+    {
+      list.insert(
+        0,
+        workspace::Workspace {
+          name: l
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+          path: l.clone(),
+        },
+      );
     }
-    _ => Err((-32601, format!("method not found: {method}"))),
+    if list.is_empty() {
+      return "no folders; open some in the mig window or add them with `mig ws add`".into();
+    }
+    for w in list {
+      let detail = match repo::open(&w.path) {
+        Ok(r) => {
+          let branch = repo::branch_name(&r).unwrap_or_else(|| "(detached)".into());
+          let agent = agent::session(&r)
+            .map(|s| format!("  agent: {}", s.name))
+            .unwrap_or_default();
+          format!("{branch}{agent}")
+        }
+        Err(_) => "(missing)".into(),
+      };
+      let start = if self.launch.as_ref().is_some_and(|l| workspace::same(l, &w.path)) {
+        "  [default]"
+      } else {
+        ""
+      };
+      out.push_str(&format!("{}  {}  {detail}{start}\n", w.name, w.path.display()));
+    }
+    out
+  }
+
+  fn call(&self, name: &str, args: &Value) -> Result<String> {
+    if name == "repos" {
+      return Ok(self.repos());
+    }
+    let root = workspace::pick(self.launch.as_deref(), args.get("repo").and_then(Value::as_str))?;
+    run_tool(&repo::open(&root)?, name, args)
+  }
+
+  fn handle(&self, msg: &Value) -> std::result::Result<Value, (i64, String)> {
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let params = msg.get("params").cloned().unwrap_or(Value::Null);
+    match method {
+      "initialize" => Ok(json!({
+        "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
+        "capabilities": {"tools": {}},
+        "serverInfo": {"name": "mig", "version": env!("CARGO_PKG_VERSION")},
+        "instructions": INSTRUCTIONS,
+      })),
+      "ping" => Ok(json!({})),
+      "tools/list" => Ok(json!({"tools": tools()})),
+      "tools/call" => {
+        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        let (text, is_error) = match self.call(name, &args) {
+          Ok(t) => (t, false),
+          Err(e) => (format!("{e:#}"), true),
+        };
+        Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+      }
+      _ => Err((-32601, format!("method not found: {method}"))),
+    }
   }
 }
 
+const INSTRUCTIONS: &str = "Version control and file tools. Several folders may be open: call `repos` to see them and pass `repo` to choose one (the default is the folder the server started in). Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.";
+
 pub fn serve(dir: &Path) -> Result<()> {
+  let server = Server {
+    launch: repo::open(dir).ok().and_then(|r| {
+      r.workdir()
+        .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()))
+    }),
+  };
   let stdin = std::io::stdin();
   let mut stdout = std::io::stdout();
   for line in stdin.lock().lines() {
@@ -342,7 +417,7 @@ pub fn serve(dir: &Path) -> Result<()> {
       Ok(msg) => {
         // Notifications (no id) get no reply.
         let Some(id) = msg.get("id").cloned() else { continue };
-        match handle(dir, &msg) {
+        match server.handle(&msg) {
           Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
           Err((code, message)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}),
         }

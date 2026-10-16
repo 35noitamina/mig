@@ -11,7 +11,7 @@ use crate::ai::AiConfig;
 use crate::assist::ContextOpts;
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, agent, ai, assist, gc, growth, oplog, ops, repo, rev, scan, setup, split};
+use crate::{absorb, agent, ai, assist, gc, growth, oplog, ops, repo, rev, scan, setup, split, workspace};
 
 const HELP: &str = "\
 {about}
@@ -60,6 +60,7 @@ Agent sessions (mig agent):
 For AI tools:
   context            Markdown overview of the repository, secrets redacted
   mcp                Run as an MCP server over stdio
+  ws                 Folders the GUI window and the MCP server work in (ls, add, rm, rename)
 
 GUI:
   gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
@@ -158,6 +159,9 @@ enum Cmd {
   },
   /// Run an MCP (Model Context Protocol) server on stdin/stdout for AI clients
   Mcp,
+  /// Folders open in the GUI window; AI tools (MCP) may work only in these
+  #[command(subcommand)]
+  Ws(WsCmd),
 
   // Earlier top-level spellings, kept working but out of the help.
   #[command(hide = true)]
@@ -180,6 +184,22 @@ enum Cmd {
   Gc,
   #[command(hide = true)]
   Size(SizeArgs),
+}
+
+#[derive(Subcommand)]
+enum WsCmd {
+  /// List the open folders
+  Ls,
+  /// Add a repository (default: the current one)
+  Add {
+    path: Option<PathBuf>,
+    #[arg(long)]
+    name: Option<String>,
+  },
+  /// Remove a folder from the list (its files are not touched)
+  Rm { name: String },
+  /// Give a folder another name
+  Rename { name: String, new: String },
 }
 
 #[derive(Subcommand)]
@@ -522,6 +542,7 @@ enum Top {
   Init(InitArgs),
   Ai(AiCmd),
   Mcp,
+  Ws(WsCmd),
   #[cfg_attr(not(feature = "gui"), allow(dead_code))]
   Gui(Option<PathBuf>),
   Repo(Action),
@@ -535,6 +556,7 @@ impl Cmd {
       Cmd::Gui { target } => return Ok(Top::Gui(target)),
       Cmd::Ai(a) => return Ok(Top::Ai(a)),
       Cmd::Mcp => return Ok(Top::Mcp),
+      Cmd::Ws(w) => return Ok(Top::Ws(w)),
       Cmd::Agent(a) => A::Agent(a),
       Cmd::Context { diff, files, count } => A::Context(ContextOpts {
         diff,
@@ -685,6 +707,7 @@ pub fn run() -> Result<()> {
     Top::Gui(_) => return Err(anyhow!("this build has no GUI (rebuild with --features gui)")),
     Top::Ai(a) => return run_ai(&dir, a),
     Top::Mcp => return crate::mcp::serve(&dir),
+    Top::Ws(w) => return run_ws(&dir, w),
     Top::Repo(a) => a,
   };
 
@@ -1503,6 +1526,33 @@ fn size_graph(repo: &Repository, by: By, measure: Measure, last: usize, json: bo
       "{}",
       paint("2", &format!("showing {} of {} points", shown.len(), rows.len()))
     );
+  }
+  Ok(())
+}
+
+fn run_ws(dir: &std::path::Path, cmd: WsCmd) -> Result<()> {
+  match cmd {
+    WsCmd::Ls => {
+      let list = workspace::load();
+      if list.is_empty() {
+        println!("no folders; add one with `mig ws add`");
+      }
+      for w in list {
+        println!("{}  {}", paint("36", &w.name), w.path.display());
+      }
+    }
+    WsCmd::Add { path, name } => {
+      let w = workspace::add(&dir.join(path.unwrap_or_default()), name.as_deref())?;
+      println!("{}  {}", paint("36", &w.name), w.path.display());
+    }
+    WsCmd::Rm { name } => {
+      let w = workspace::remove(&name)?;
+      println!("removed {} ({})", w.name, w.path.display());
+    }
+    WsCmd::Rename { name, new } => {
+      workspace::rename(&name, &new)?;
+      println!("renamed {name} to {new}");
+    }
   }
   Ok(())
 }
