@@ -103,15 +103,77 @@ fn clip(line: &str, max: usize) -> String {
   format!("{head}… (+{} chars)", line.chars().count() - max)
 }
 
-fn after_write(repo: &Repository, message: &str) -> String {
-  if agent::session(repo).is_none() {
-    return "no agent session, so mig cannot undo this (agent_start first)".into();
+// Per connection: the agent this client works as, and what it last saw of each file.
+pub struct Ctx<'a> {
+  pub agent: Option<agent::Session>,
+  // Path -> hash of the content this client last read or wrote.
+  pub seen: &'a mut HashMap<String, String>,
+}
+
+impl Ctx<'_> {
+  fn agent_name(&self) -> Option<&str> {
+    self.agent.as_ref().map(|s| s.name.as_str())
   }
-  match agent::checkpoint(repo, message) {
-    Ok(Some(o)) => format!("checkpoint {}", repo::short(o)),
+}
+
+// Refuses to change a file that someone else changed after this client last read or wrote it.
+fn guard_fresh(repo: &Repository, ctx: &Ctx, name: &str, current: Option<&[u8]>) -> Result<()> {
+  let Some(seen) = ctx.seen.get(name) else { return Ok(()) };
+  if current.map(agent::hash).as_ref() == Some(seen) {
+    return Ok(());
+  }
+  let by = live::recent_by_other(repo.path(), name, ctx.agent_name(), 3_600_000)
+    .map(|e| {
+      format!(
+        " (by {} at {})",
+        e.agent.unwrap_or(e.tool),
+        chrono::DateTime::from_timestamp_millis(e.ts)
+          .map(|t| t.with_timezone(&chrono::Local).format("%H:%M:%S").to_string())
+          .unwrap_or_default()
+      )
+    })
+    .unwrap_or_default();
+  bail!("{name} changed since you last read it{by}. Read it again before changing it; nothing was written.")
+}
+
+// Records one file change for the agent and checkpoints; returns a line for the reply.
+fn after_write(
+  repo: &Repository,
+  ctx: &mut Ctx,
+  changes: &[(String, Option<Vec<u8>>, Option<Vec<u8>>)],
+  message: &str,
+) -> String {
+  for (name, _, after) in changes {
+    match after {
+      Some(a) => ctx.seen.insert(name.clone(), agent::hash(a)),
+      None => ctx.seen.remove(name),
+    };
+  }
+  let Some(s) = &ctx.agent else {
+    return "no agent session, so mig cannot undo this (agent_start first)".into();
+  };
+  for (name, before, after) in changes {
+    if let Err(e) = agent::record_write(repo, &s.id, name, before.as_deref(), after.as_deref()) {
+      return format!("could not record this for agent {}: {e:#}", s.name);
+    }
+  }
+  match agent::checkpoint(repo, &s.id, message) {
+    Ok(Some(o)) => format!("agent {}: checkpoint {}", s.name, repo::short(o)),
     Ok(None) => String::new(),
     Err(e) => format!("checkpoint failed: {e:#}"),
   }
+}
+
+// Files below `dir` with their content (for moving or deleting a folder).
+fn files_under(root: &Path, dir: &Path) -> Vec<(String, Vec<u8>)> {
+  WalkBuilder::new(dir)
+    .hidden(false)
+    .git_ignore(false)
+    .build()
+    .flatten()
+    .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+    .filter_map(|e| Some((rel(root, e.path()), std::fs::read(e.path()).ok()?)))
+    .collect()
 }
 
 fn with_note(summary: String, note: String) -> String {
@@ -166,7 +228,14 @@ pub fn ls(repo: &Repository, args: &Value) -> Result<String> {
   Ok(out)
 }
 
-fn read_one(root: &Path, input: &str, from: Option<usize>, to: Option<usize>, budget: usize) -> Result<String> {
+fn read_one(
+  root: &Path,
+  input: &str,
+  from: Option<usize>,
+  to: Option<usize>,
+  budget: usize,
+  seen: &mut HashMap<String, String>,
+) -> Result<String> {
   let path = resolve(root, input)?;
   let meta = std::fs::metadata(&path).map_err(|_| anyhow!("{input}: no such file"))?;
   if meta.is_dir() {
@@ -180,6 +249,7 @@ fn read_one(root: &Path, input: &str, from: Option<usize>, to: Option<usize>, bu
     ));
   }
   let bytes = std::fs::read(&path)?;
+  seen.insert(name.clone(), agent::hash(&bytes));
   if is_binary(&bytes) {
     return Ok(format!(
       "{name}  {}  binary file, not shown",
@@ -229,7 +299,7 @@ fn read_one(root: &Path, input: &str, from: Option<usize>, to: Option<usize>, bu
   Ok(out)
 }
 
-pub fn read(repo: &Repository, args: &Value) -> Result<String> {
+pub fn read(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   read_one(
     &root,
@@ -237,10 +307,11 @@ pub fn read(repo: &Repository, args: &Value) -> Result<String> {
     number(args, "from"),
     number(args, "to"),
     MAX_OUT,
+    ctx.seen,
   )
 }
 
-pub fn read_many(repo: &Repository, args: &Value) -> Result<String> {
+pub fn read_many(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   let files = args
     .get("files")
@@ -256,7 +327,7 @@ pub fn read_many(repo: &Repository, args: &Value) -> Result<String> {
       out.push_str(&format!("{path}  skipped (output limit reached)\n\n"));
       continue;
     }
-    match read_one(&root, &path, from, to, MAX_OUT - out.len()) {
+    match read_one(&root, &path, from, to, MAX_OUT - out.len(), ctx.seen) {
       Ok(s) => out.push_str(&s),
       Err(e) => out.push_str(&format!("{e:#}\n")),
     }
@@ -485,12 +556,13 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
   Ok(())
 }
 
-pub fn edit(repo: &Repository, args: &Value) -> Result<String> {
+pub fn edit(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   let input = required(args, "path")?;
   let path = resolve(&root, &input)?;
   let name = rel(&root, &path);
   let bytes = std::fs::read(&path).map_err(|_| anyhow!("{input}: no such file"))?;
+  guard_fresh(repo, ctx, &name, Some(&bytes))?;
   let original = String::from_utf8(bytes).map_err(|_| anyhow!("{input} is not UTF-8 text"))?;
   let edits = parse_edits(args)?;
   let updated = apply_edits(&original, &edits)?;
@@ -506,13 +578,18 @@ pub fn edit(repo: &Repository, args: &Value) -> Result<String> {
   if flag(args, "dry_run") {
     return Ok(format!("would edit {name}  +{added} -{removed}\n{patch}"));
   }
-  live::record(repo, "mig edit", &name);
+  live::record(repo, "mig edit", &name, ctx.agent_name());
   write_atomic(&path, updated.as_bytes())?;
-  let note = after_write(repo, &format!("edit {name}"));
+  let note = after_write(
+    repo,
+    ctx,
+    &[(name.clone(), Some(original.into_bytes()), Some(updated.into_bytes()))],
+    &format!("edit {name}"),
+  );
   Ok(with_note(format!("edited {name}  +{added} -{removed}\n{patch}"), note))
 }
 
-pub fn write(repo: &Repository, args: &Value) -> Result<String> {
+pub fn write(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   let input = required(args, "path")?;
   let content = text(args, "content").ok_or_else(|| anyhow!("content is required"))?;
@@ -528,26 +605,33 @@ pub fn write(repo: &Repository, args: &Value) -> Result<String> {
     bail!("{input} is a folder");
   }
   let name = rel(&root, &path);
-  refuse_secrets(repo, &name, &content)?;
   let previous = std::fs::read(&path).ok();
-  live::record(repo, "mig write", &name);
+  guard_fresh(repo, ctx, &name, previous.as_deref())?;
+  refuse_secrets(repo, &name, &content)?;
+  live::record(repo, "mig write", &name, ctx.agent_name());
   write_atomic(&path, content.as_bytes())?;
-  let summary = match previous.map(String::from_utf8) {
+  let summary = match previous.as_ref().map(|p| std::str::from_utf8(p)) {
     None => format!(
       "created {name}  {} lines  {}",
       content.lines().count(),
       guard::fmt_size(content.len() as u64)
     ),
     Some(Ok(old)) => {
-      let (_, added, removed) = diff(&old, &content, &name)?;
+      let (_, added, removed) = diff(old, &content, &name)?;
       format!("overwrote {name}  +{added} -{removed}")
     }
     Some(Err(_)) => format!("overwrote {name} (was binary)"),
   };
-  Ok(with_note(summary, after_write(repo, &format!("write {name}"))))
+  let note = after_write(
+    repo,
+    ctx,
+    &[(name.clone(), previous, Some(content.into_bytes()))],
+    &format!("write {name}"),
+  );
+  Ok(with_note(summary, note))
 }
 
-pub fn move_path(repo: &Repository, args: &Value) -> Result<String> {
+pub fn move_path(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   let (from, to) = (required(args, "from")?, required(args, "to")?);
   let (src, dst) = (resolve(&root, &from)?, resolve(&root, &to)?);
@@ -557,17 +641,32 @@ pub fn move_path(repo: &Repository, args: &Value) -> Result<String> {
   if dst.exists() {
     bail!("{to} already exists");
   }
+  let (src_name, dst_name) = (rel(&root, &src), rel(&root, &dst));
+  let moved: Vec<(String, Vec<u8>)> = if src.is_dir() {
+    files_under(&root, &src)
+  } else {
+    vec![(src_name.clone(), std::fs::read(&src)?)]
+  };
+  for (n, bytes) in &moved {
+    guard_fresh(repo, ctx, n, Some(bytes))?;
+  }
   if let Some(dir) = dst.parent() {
     std::fs::create_dir_all(dir)?;
   }
-  live::record(repo, "mig move", &rel(&root, &src));
-  live::record(repo, "mig move", &rel(&root, &dst));
+  live::record(repo, "mig move", &src_name, ctx.agent_name());
+  live::record(repo, "mig move", &dst_name, ctx.agent_name());
   std::fs::rename(&src, &dst)?;
-  let summary = format!("moved {} -> {}", rel(&root, &src), rel(&root, &dst));
-  Ok(with_note(summary, after_write(repo, &format!("move {from}"))))
+  let mut changes = Vec::new();
+  for (n, bytes) in moved {
+    let target = format!("{dst_name}{}", n.strip_prefix(&src_name).unwrap_or(""));
+    changes.push((n, Some(bytes.clone()), None));
+    changes.push((target, None, Some(bytes)));
+  }
+  let note = after_write(repo, ctx, &changes, &format!("move {from}"));
+  Ok(with_note(format!("moved {src_name} -> {dst_name}"), note))
 }
 
-pub fn delete(repo: &Repository, args: &Value) -> Result<String> {
+pub fn delete(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let root = root(repo)?;
   let input = required(args, "path")?;
   let path = resolve(&root, &input)?;
@@ -575,21 +674,31 @@ pub fn delete(repo: &Repository, args: &Value) -> Result<String> {
     bail!("refusing to delete the repository root");
   }
   let name = rel(&root, &path);
-  live::record(repo, "mig delete", &name);
-  let summary = if path.is_dir() {
+  let gone: Vec<(String, Vec<u8>)> = if path.is_dir() {
     let entries = std::fs::read_dir(&path)?.count();
     if entries > 0 && !flag(args, "recursive") {
       bail!("{input} is a folder with {entries} entries; set recursive=true to delete it");
     }
-    std::fs::remove_dir_all(&path)?;
-    format!("deleted folder {name}")
+    files_under(&root, &path)
   } else if path.exists() {
-    std::fs::remove_file(&path)?;
-    format!("deleted {name}")
+    vec![(name.clone(), std::fs::read(&path)?)]
   } else {
     bail!("{input}: no such file or folder");
   };
-  Ok(with_note(summary, after_write(repo, &format!("delete {name}"))))
+  for (n, bytes) in &gone {
+    guard_fresh(repo, ctx, n, Some(bytes))?;
+  }
+  live::record(repo, "mig delete", &name, ctx.agent_name());
+  let summary = if path.is_dir() {
+    std::fs::remove_dir_all(&path)?;
+    format!("deleted folder {name}")
+  } else {
+    std::fs::remove_file(&path)?;
+    format!("deleted {name}")
+  };
+  let changes: Vec<_> = gone.into_iter().map(|(n, b)| (n, Some(b), None)).collect();
+  let note = after_write(repo, ctx, &changes, &format!("delete {name}"));
+  Ok(with_note(summary, note))
 }
 
 #[cfg(test)]

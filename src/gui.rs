@@ -94,7 +94,7 @@ struct App {
   ai: AiPanel,
   size: SizeView,
   live: LiveView,
-  agent: Option<agent::Session>,
+  agents: Vec<agent::Session>,
 }
 
 struct SaveJob {
@@ -391,7 +391,7 @@ impl App {
     let repo = repo::open(dir)?;
     let root = repo.workdir().unwrap_or(dir).to_path_buf();
     let cfg = config::load_dir(&root).unwrap_or_default();
-    let agent = agent::session(&repo);
+    let agents = agent::list(&repo);
     let ai = AiPanel::new(root.clone(), ctx.clone());
     let size = SizeView::new(root.clone(), ctx.clone());
     let live = LiveView::new(root.clone(), ctx.clone());
@@ -434,7 +434,7 @@ impl App {
       ai,
       size,
       live,
-      agent,
+      agents,
     };
     app.refresh();
     Ok(app)
@@ -449,7 +449,7 @@ impl App {
   // Starts a background refresh; results are applied by poll_refresh as they arrive.
   fn refresh(&mut self) {
     self.last_refresh = Instant::now();
-    self.agent = agent::session(&self.repo);
+    self.agents = agent::list(&self.repo);
     if self.loading.is_some() {
       self.refresh_again = true;
       return;
@@ -803,9 +803,10 @@ impl App {
           }
         }
       });
-      let agent_label = match &self.agent {
-        Some(a) => RichText::new(format!("Agent: {}", a.name)).color(Color32::from_rgb(140, 180, 230)),
-        None => RichText::new("Agent"),
+      let agent_label = match self.agents.as_slice() {
+        [] => RichText::new("Agent"),
+        [a] => RichText::new(format!("Agent: {}", a.name)).color(Color32::from_rgb(140, 180, 230)),
+        many => RichText::new(format!("Agents ({})", many.len())).color(Color32::from_rgb(140, 180, 230)),
       };
       ui.menu_button(agent_label, |ui| self.agent_menu(ui))
         .response
@@ -1086,51 +1087,66 @@ impl App {
   }
 
   fn agent_menu(&mut self, ui: &mut egui::Ui) {
-    if self.agent.is_none() {
+    if ui
+      .button("Start session")
+      .on_hover_text("Snapshot the working tree before an AI agent starts working; several sessions can run at once")
+      .clicked()
+    {
+      let mut n = self.agents.len() + 1;
+      while self.agents.iter().any(|s| s.name == format!("gui-{n}")) {
+        n += 1;
+      }
+      let r = agent::start(&self.repo, &format!("gui-{n}"))
+        .map(|s| format!("agent session {} started on {}", s.name, s.branch));
+      self.done(r);
+      ui.close();
+    }
+    for s in self.agents.clone() {
+      ui.separator();
+      ui.label(RichText::new(&s.name).strong());
       if ui
-        .button("Start session")
-        .on_hover_text("Snapshot the working tree before an AI agent starts working")
+        .button("Checkpoint")
+        .on_hover_text("Snapshot the working tree now (no commit)")
         .clicked()
       {
-        let r = agent::start(&self.repo, "gui").map(|s| format!("agent session started on {}", s.branch));
+        let r = agent::checkpoint(&self.repo, &s.id, "checkpoint").map(|o| match o {
+          Some(o) => format!("checkpoint {}", repo::short(o)),
+          None => "nothing changed since the last checkpoint".into(),
+        });
         self.done(r);
         ui.close();
       }
-      return;
-    }
-    if ui
-      .button("Checkpoint")
-      .on_hover_text("Snapshot the working tree now (no commit)")
-      .clicked()
-    {
-      let r = agent::checkpoint(&self.repo, "checkpoint").map(|o| match o {
-        Some(o) => format!("checkpoint {}", repo::short(o)),
-        None => "nothing changed since the last checkpoint".into(),
-      });
-      self.done(r);
-      ui.close();
-    }
-    if ui
-      .button("Finish…")
-      .on_hover_text("Squash everything since the start into one commit")
-      .clicked()
-    {
-      if let Err(e) = self.editor.save_all() {
-        self.status = Err(e);
-      } else {
-        self.ai.open_finish();
+      if ui
+        .button("Finish…")
+        .on_hover_text("Turn the session's work into one commit")
+        .clicked()
+      {
+        if let Err(e) = self.editor.save_all() {
+          self.status = Err(e);
+        } else {
+          self.ai.open_finish(&s);
+        }
+        ui.close();
       }
-      ui.close();
-    }
-    if ui
-      .button(RichText::new("Abort").color(Color32::from_rgb(230, 110, 110)))
-      .on_hover_text("Throw away everything since the start (kept recoverable with `mig agent restore`)")
-      .clicked()
-    {
-      let r =
-        agent::abort(&self.repo).map(|o| format!("agent session aborted; discarded work kept as {}", repo::short(o)));
-      self.done(r);
-      ui.close();
+      if ui
+        .button(RichText::new("Abort").color(Color32::from_rgb(230, 110, 110)))
+        .on_hover_text("Throw away the session's work (kept recoverable with `mig agent restore`)")
+        .clicked()
+      {
+        let r = agent::abort(&self.repo, &s.id).map(|a| {
+          let mut m = format!(
+            "agent session {} aborted; discarded work kept as {}",
+            s.name,
+            repo::short(a.saved)
+          );
+          if !a.kept.is_empty() {
+            m.push_str(&format!("; left {} file(s) changed by others", a.kept.len()));
+          }
+          m
+        });
+        self.done(r);
+        ui.close();
+      }
     }
   }
 
@@ -1412,7 +1428,14 @@ impl App {
     match self.mode {
       Mode::History => self.history(ui),
       Mode::Live => {
-        let session = self.agent.as_ref().map(|s| s.name.clone());
+        let session = (!self.agents.is_empty()).then(|| {
+          self
+            .agents
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+        });
         self.live.ui(ui, session.as_deref());
       }
       Mode::Size => {

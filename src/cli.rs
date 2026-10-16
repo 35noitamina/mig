@@ -244,7 +244,7 @@ enum AiCmd {
 
 #[derive(Subcommand)]
 enum AgentCmd {
-  /// Snapshot the working tree and start a session
+  /// Snapshot the working tree and start a session (several can run at once)
   Start {
     #[arg(default_value = "agent")]
     name: String,
@@ -253,22 +253,37 @@ enum AgentCmd {
   Cp {
     #[arg(short, long, default_value = "checkpoint")]
     message: String,
+    /// Session to use when several are running
+    #[arg(long)]
+    name: Option<String>,
   },
   /// List the session's checkpoints
-  Log,
+  Log {
+    #[arg(long)]
+    name: Option<String>,
+  },
   /// Bring the working tree back to a checkpoint (number from `log`, or an id)
-  Restore { checkpoint: String },
-  /// Squash everything since start into one commit and end the session
+  Restore {
+    checkpoint: String,
+    #[arg(long)]
+    name: Option<String>,
+  },
+  /// Turn the session's work into one commit and end it
   Finish {
     #[arg(short, long)]
     message: Option<String>,
     /// Let the AI write the message
     #[arg(long)]
     ai: bool,
+    #[arg(long)]
+    name: Option<String>,
   },
-  /// Throw away everything since start and end the session
-  Abort,
-  /// Show the current session
+  /// Throw away the session's work and end it
+  Abort {
+    #[arg(long)]
+    name: Option<String>,
+  },
+  /// Show the running sessions
   Status,
 }
 
@@ -1371,14 +1386,21 @@ fn run_agent(repo: &Repository, cmd: AgentCmd) -> Result<()> {
     AgentCmd::Start { name } => {
       let s = agent::start(repo, &name)?;
       println!("agent session \"{}\" started on {}", s.name, s.branch);
+      if s.shared {
+        println!("other sessions are running too; each one finishes or aborts only the files it wrote through mig");
+      }
       println!("checkpoint with `mig agent cp`, end with `mig agent finish` or `mig agent abort`");
     }
-    AgentCmd::Cp { message } => match agent::checkpoint(repo, &message)? {
-      Some(o) => println!("checkpoint {}", paint("33", &repo::short(o))),
-      None => println!("nothing changed since the last checkpoint"),
-    },
-    AgentCmd::Log => {
-      for (i, c) in agent::checkpoints(repo)?.iter().enumerate() {
+    AgentCmd::Cp { message, name } => {
+      let s = agent::resolve(repo, name.as_deref())?;
+      match agent::checkpoint(repo, &s.id, &message)? {
+        Some(o) => println!("checkpoint {}", paint("33", &repo::short(o))),
+        None => println!("nothing changed since the last checkpoint"),
+      }
+    }
+    AgentCmd::Log { name } => {
+      let s = agent::resolve(repo, name.as_deref())?;
+      for (i, c) in agent::checkpoints(repo, &s.id)?.iter().enumerate() {
         println!(
           "{:>4}  {}  {}  {}",
           i + 1,
@@ -1388,42 +1410,60 @@ fn run_agent(repo: &Repository, cmd: AgentCmd) -> Result<()> {
         );
       }
     }
-    AgentCmd::Restore { checkpoint } => {
-      let o = agent::restore(repo, &checkpoint)?;
+    AgentCmd::Restore { checkpoint, name } => {
+      let o = agent::restore(repo, name.as_deref(), &checkpoint)?;
       println!("working tree restored to {}", paint("33", &repo::short(o)));
     }
-    AgentCmd::Finish { message, ai } => {
-      let f = agent::finish(repo, message.as_deref(), ai)?;
+    AgentCmd::Finish { message, ai, name } => {
+      let s = agent::resolve(repo, name.as_deref())?;
+      let f = agent::finish(repo, &s.id, message.as_deref(), ai)?;
       println!(
-        "session finished: {} commit(s) since start; HEAD is {}",
+        "session {} finished: {} commit(s) since start; HEAD is {}",
+        s.name,
         f.commits,
         paint("33", &f.head.map(repo::short).unwrap_or_default())
       );
+      if f.left > 0 {
+        println!("{} changed file(s) of other sessions were left uncommitted", f.left);
+      }
     }
-    AgentCmd::Abort => {
-      let saved = agent::abort(repo)?;
-      println!("session aborted; everything since start was discarded");
+    AgentCmd::Abort { name } => {
+      let s = agent::resolve(repo, name.as_deref())?;
+      let a = agent::abort(repo, &s.id)?;
+      if s.shared {
+        println!("session {} aborted; {} file(s) put back", s.name, a.reverted);
+        if !a.kept.is_empty() {
+          println!("left as they are (changed after this agent): {}", a.kept.join(", "));
+        }
+      } else {
+        println!("session {} aborted; everything since start was discarded", s.name);
+      }
       println!(
         "the discarded work is kept as {}; `mig agent restore {}` brings it back",
-        paint("33", &repo::short(saved)),
-        repo::short(saved)
+        paint("33", &repo::short(a.saved)),
+        repo::short(a.saved)
       );
     }
-    AgentCmd::Status => match agent::status(repo)? {
-      None => println!("no agent session"),
-      Some(s) => {
+    AgentCmd::Status => {
+      let all = agent::status(repo)?;
+      if all.is_empty() {
+        println!("no agent session");
+      }
+      for st in all {
+        let s = &st.session;
         println!(
-          "session   {} (on {}, since {})",
-          s.session.name,
-          s.session.branch,
-          fmt_time(s.session.started)
+          "{}  on {}, since {}{}",
+          paint("36", &s.name),
+          s.branch,
+          fmt_time(s.started),
+          if s.shared { ", alongside other sessions" } else { "" }
         );
         println!(
-          "checkpoints {}, commits since start {}, changed files {}",
-          s.checkpoints, s.commits, s.changed_files
+          "  checkpoints {}, commits since start {}, files {}",
+          st.checkpoints, st.commits, st.changed_files
         );
       }
-    },
+    }
   }
   Ok(())
 }

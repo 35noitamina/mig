@@ -24,6 +24,8 @@ struct Job {
 }
 
 struct FinishDialog {
+  id: String,
+  name: String,
   message: String,
 }
 
@@ -123,8 +125,12 @@ impl AiPanel {
     });
   }
 
-  pub fn open_finish(&mut self) {
-    self.finish = Some(FinishDialog { message: String::new() });
+  pub fn open_finish(&mut self, session: &agent::Session) {
+    self.finish = Some(FinishDialog {
+      id: session.id.clone(),
+      name: session.name.clone(),
+      message: String::new(),
+    });
   }
 
   // Returns a status line when a job ends.
@@ -234,12 +240,12 @@ impl AiPanel {
     if let Some(d) = &mut self.finish {
       let mut close = false;
       let mut go: Option<Option<String>> = None;
-      egui::Window::new("Finish agent session")
+      egui::Window::new(format!("Finish agent session {}", d.name))
         .pivot(egui::Align2::CENTER_CENTER)
         .default_pos(ctx.content_rect().center())
         .collapsible(false)
         .show(ctx, |ui| {
-          ui.label("Everything since the session started becomes one commit.");
+          ui.label("The session's work becomes one commit (with other sessions running, only the files it wrote).");
           ui.add(
             egui::TextEdit::multiline(&mut d.message)
               .hint_text("commit message (leave empty to let the AI write it)")
@@ -265,9 +271,10 @@ impl AiPanel {
           });
         });
       if let Some(msg) = go {
+        let id = d.id.clone();
         self.finish = None;
         self.spawn("finishing the agent session…", move |repo, _| {
-          let f = agent::finish(repo, msg.as_deref(), msg.is_none())?;
+          let f = agent::finish(repo, &id, msg.as_deref(), msg.is_none())?;
           Ok((
             Out::Done(format!(
               "agent session finished; HEAD is {}",

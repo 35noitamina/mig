@@ -15,6 +15,8 @@ pub struct Entry {
   pub ts: i64,
   pub tool: String,
   pub path: String,
+  #[serde(default)]
+  pub agent: Option<String>,
 }
 
 pub fn now_ms() -> i64 {
@@ -34,7 +36,7 @@ fn read_all(git_dir: &Path) -> Vec<Entry> {
 }
 
 // Best effort: a failure to log must never stop the file operation itself.
-pub fn record(repo: &Repository, tool: &str, path: &str) {
+pub fn record(repo: &Repository, tool: &str, path: &str, agent: Option<&str>) {
   let file = log_path(repo.path());
   if let Some(dir) = file.parent() {
     let _ = std::fs::create_dir_all(dir);
@@ -52,6 +54,7 @@ pub fn record(repo: &Repository, tool: &str, path: &str) {
     ts: now_ms(),
     tool: tool.to_string(),
     path: path.to_string(),
+    agent: agent.map(str::to_string),
   };
   if let (Ok(line), Ok(mut f)) = (
     serde_json::to_string(&entry),
@@ -68,5 +71,19 @@ pub fn recent(git_dir: &Path, path: &str, within_ms: i64) -> Option<Entry> {
   read_all(git_dir)
     .into_iter()
     .rev()
-    .find(|e| now - e.ts <= within_ms && (e.path == path || path.starts_with(&format!("{}/", e.path))))
+    .find(|e| now - e.ts <= within_ms && covers(e, path))
+}
+
+fn covers(e: &Entry, path: &str) -> bool {
+  e.path == path || path.starts_with(&format!("{}/", e.path))
+}
+
+// The newest entry for `path` written by someone other than `me`.
+pub fn recent_by_other(git_dir: &Path, path: &str, me: Option<&str>, within_ms: i64) -> Option<Entry> {
+  let now = now_ms();
+  read_all(git_dir)
+    .into_iter()
+    .rev()
+    .take_while(|e| now - e.ts <= within_ms)
+    .find(|e| covers(e, path) && e.agent.as_deref() != me)
 }

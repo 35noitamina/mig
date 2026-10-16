@@ -1,9 +1,10 @@
 // A Model Context Protocol server over stdio (newline-delimited JSON-RPC 2.0), so AI clients can
 // use mig as a set of tools. Only protocol messages go to stdout.
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use git2::Repository;
 use serde_json::{Value, json};
 
@@ -156,26 +157,32 @@ fn tools() -> Vec<Value> {
     ),
     tool(
       "agent_start",
-      "Start an agent session: snapshots the working tree so all later work can be squashed or thrown away.",
-      json!({"name": {"type": "string", "description": "What the session is for"}}),
+      "Start your agent session in this folder. Other agents may work here at the same time: every file you change through mig is recorded as yours, so finishing or aborting affects only your work.",
+      json!({"name": {"type": "string", "description": "A short unique name for you, e.g. \"refactor-parser\""}}),
       &[],
     ),
     tool(
       "checkpoint",
-      "Snapshot the working tree inside the agent session without committing. Use after each meaningful step.",
-      json!({"message": {"type": "string"}}),
+      "Snapshot the working tree inside your agent session without committing.",
+      json!({
+        "message": {"type": "string"},
+        "name": {"type": "string", "description": "Session to use (default: yours)"}
+      }),
       &[],
     ),
     tool(
       "agent_finish",
-      "End the agent session, turning all its work into one commit with this message.",
-      json!({"message": {"type": "string"}}),
+      "End your agent session, turning your work into one commit with this message. When other agents work in the same folder, only the files you changed are committed.",
+      json!({
+        "message": {"type": "string"},
+        "name": {"type": "string", "description": "Session to finish (default: yours)"}
+      }),
       &["message"],
     ),
     tool(
       "agent_abort",
-      "End the agent session and restore the working tree and branch to how they were at the start. The discarded work stays recoverable.",
-      none,
+      "End your agent session and undo your work. Alone, the folder and branch go back to how they were at the start; with other agents, only your files are put back, and files someone changed after you are left alone. The discarded work stays recoverable.",
+      json!({"name": {"type": "string", "description": "Session to abort (default: yours)"}}),
       &[],
     ),
   ]
@@ -185,7 +192,44 @@ fn text(v: &Value, key: &str) -> Option<String> {
   v.get(key).and_then(Value::as_str).map(str::to_string)
 }
 
-fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
+// What one connection knows about one folder.
+#[derive(Default)]
+struct RepoConn {
+  agent: Option<String>,
+  seen: HashMap<String, String>,
+}
+
+// The session this connection works as: the one it started, else one started by this process,
+// else the only session, when no MCP client started it.
+fn current_agent(repo: &Repository, rc: &mut RepoConn) -> Option<agent::Session> {
+  if let Some(id) = &rc.agent {
+    if let Some(s) = agent::get(repo, id) {
+      return Some(s);
+    }
+    rc.agent = None;
+  }
+  let all = agent::list(repo);
+  let me = std::process::id();
+  let pick = all
+    .iter()
+    .find(|s| s.owner == Some(me))
+    .cloned()
+    .or_else(|| match all.as_slice() {
+      [only] if only.owner.is_none() => Some(only.clone()),
+      _ => None,
+    })?;
+  rc.agent = Some(pick.id.clone());
+  Some(pick)
+}
+
+fn target_agent(repo: &Repository, rc: &mut RepoConn, args: &Value) -> Result<agent::Session> {
+  match text(args, "name") {
+    Some(n) => agent::get(repo, &n).ok_or_else(|| anyhow!("no agent session named {n}")),
+    None => current_agent(repo, rc).ok_or_else(|| anyhow!("you have no agent session here; call agent_start first")),
+  }
+}
+
+fn run_tool(repo: &Repository, name: &str, args: &Value, rc: &mut RepoConn) -> Result<String> {
   match name {
     "status" => {
       let mut out = format!(
@@ -199,22 +243,41 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
       for c in changes.iter().take(300) {
         out.push_str(&format!("{} {}\n", c.kind, c.path));
       }
-      if let Some(s) = agent::status(repo)? {
+      let mine = current_agent(repo, rc).map(|s| s.id);
+      for st in agent::status(repo)? {
+        let s = &st.session;
         out.push_str(&format!(
-          "agent session \"{}\": {} checkpoint(s), {} commit(s) since start\n",
-          s.session.name, s.checkpoints, s.commits
+          "agent session \"{}\"{}: {} file(s) written, {} checkpoint(s), {} commit(s) since start\n",
+          s.name,
+          if mine.as_deref() == Some(s.id.as_str()) {
+            " (you)"
+          } else {
+            ""
+          },
+          s.files.len(),
+          st.checkpoints,
+          st.commits
         ));
       }
       Ok(out)
     }
     "ls" => files::ls(repo, args),
-    "read" => files::read(repo, args),
-    "read_many" => files::read_many(repo, args),
     "search" => files::search(repo, args),
-    "edit" => files::edit(repo, args),
-    "write" => files::write(repo, args),
-    "move" => files::move_path(repo, args),
-    "delete" => files::delete(repo, args),
+    "read" | "read_many" | "edit" | "write" | "move" | "delete" => {
+      let agent = current_agent(repo, rc);
+      let mut ctx = files::Ctx {
+        agent,
+        seen: &mut rc.seen,
+      };
+      match name {
+        "read" => files::read(repo, args, &mut ctx),
+        "read_many" => files::read_many(repo, args, &mut ctx),
+        "edit" => files::edit(repo, args, &mut ctx),
+        "write" => files::write(repo, args, &mut ctx),
+        "move" => files::move_path(repo, args, &mut ctx),
+        _ => files::delete(repo, args, &mut ctx),
+      }
+    }
     "diff" => {
       let d = match text(args, "rev") {
         Some(r) => {
@@ -260,7 +323,22 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
     }
     "save" => {
       let msg = text(args, "message").ok_or_else(|| anyhow!("message is required"))?;
-      let s = oplog::record(repo, "save", || ops::save(repo, Some(&msg), &[], false)).map_err(|e| match e
+      // Next to other agents, an agent commits only the files it wrote.
+      let only: Vec<String> = match current_agent(repo, rc) {
+        Some(a) if a.shared => {
+          let mine: Vec<String> = repo::changes(repo)?
+            .into_iter()
+            .map(|c| c.path)
+            .filter(|p| a.files.contains_key(p))
+            .collect();
+          if mine.is_empty() {
+            bail!("none of your files have uncommitted changes");
+          }
+          mine
+        }
+        _ => Vec::new(),
+      };
+      let s = oplog::record(repo, "save", || ops::save(repo, Some(&msg), &only, false)).map_err(|e| match e
         .downcast_ref::<SaveBlocked>()
       {
         Some(b) => anyhow!(
@@ -290,27 +368,67 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
     }
     "agent_start" => {
       let s = agent::start(repo, &text(args, "name").unwrap_or_else(|| "agent".into()))?;
-      Ok(format!("agent session \"{}\" started on {}", s.name, s.branch))
+      agent::set_owner(repo, &s.id, std::process::id())?;
+      rc.agent = Some(s.id.clone());
+      let others: Vec<String> = agent::list(repo)
+        .into_iter()
+        .filter(|o| o.id != s.id)
+        .map(|o| o.name)
+        .collect();
+      let mut out = format!("agent session \"{}\" started on {}", s.name, s.branch);
+      if !others.is_empty() {
+        out.push_str(&format!(
+          "\nother agents working here: {}. Only files you change through mig count as yours.",
+          others.join(", ")
+        ));
+      }
+      Ok(out)
     }
     "checkpoint" => {
+      let s = target_agent(repo, rc, args)?;
       let msg = text(args, "message").unwrap_or_else(|| "checkpoint".into());
-      Ok(match agent::checkpoint(repo, &msg)? {
+      Ok(match agent::checkpoint(repo, &s.id, &msg)? {
         Some(o) => format!("checkpoint {}", repo::short(o)),
         None => "nothing changed since the last checkpoint".into(),
       })
     }
     "agent_finish" => {
+      let s = target_agent(repo, rc, args)?;
       let msg = text(args, "message").ok_or_else(|| anyhow!("message is required"))?;
-      let f = agent::finish(repo, Some(&msg), false)?;
-      Ok(format!(
-        "session finished; HEAD is {}",
+      let f = agent::finish(repo, &s.id, Some(&msg), false)?;
+      if rc.agent.as_deref() == Some(s.id.as_str()) {
+        rc.agent = None;
+      }
+      let mut out = format!(
+        "session {} finished; HEAD is {}",
+        s.name,
         f.head.map(repo::short).unwrap_or_default()
-      ))
+      );
+      if f.left > 0 {
+        out.push_str(&format!("\n{} changed file(s) of others were left uncommitted", f.left));
+      }
+      Ok(out)
     }
-    "agent_abort" => Ok(format!(
-      "session aborted; discarded work kept as {}",
-      repo::short(agent::abort(repo)?)
-    )),
+    "agent_abort" => {
+      let s = target_agent(repo, rc, args)?;
+      let a = agent::abort(repo, &s.id)?;
+      if rc.agent.as_deref() == Some(s.id.as_str()) {
+        rc.agent = None;
+      }
+      let mut out = format!(
+        "session {} aborted; {} file(s) put back; discarded work kept as {}",
+        s.name,
+        a.reverted,
+        repo::short(a.saved)
+      );
+      if !a.kept.is_empty() {
+        out.push_str(&format!(
+          "\nleft as they are (changed by someone else after you): {}",
+          a.kept.join(", ")
+        ));
+      }
+      Ok(out)
+    }
     _ => Err(anyhow!("unknown tool {name}")),
   }
 }
@@ -318,6 +436,7 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
 // One per connection: the folder the server started in.
 struct Server {
   launch: Option<PathBuf>,
+  conns: HashMap<PathBuf, RepoConn>,
 }
 
 impl Server {
@@ -345,9 +464,12 @@ impl Server {
       let detail = match repo::open(&w.path) {
         Ok(r) => {
           let branch = repo::branch_name(&r).unwrap_or_else(|| "(detached)".into());
-          let agent = agent::session(&r)
-            .map(|s| format!("  agent: {}", s.name))
-            .unwrap_or_default();
+          let names: Vec<String> = agent::list(&r).into_iter().map(|s| s.name).collect();
+          let agent = if names.is_empty() {
+            String::new()
+          } else {
+            format!("  agents: {}", names.join(", "))
+          };
           format!("{branch}{agent}")
         }
         Err(_) => "(missing)".into(),
@@ -362,15 +484,17 @@ impl Server {
     out
   }
 
-  fn call(&self, name: &str, args: &Value) -> Result<String> {
+  fn call(&mut self, name: &str, args: &Value) -> Result<String> {
     if name == "repos" {
       return Ok(self.repos());
     }
     let root = workspace::pick(self.launch.as_deref(), args.get("repo").and_then(Value::as_str))?;
-    run_tool(&repo::open(&root)?, name, args)
+    let repo = repo::open(&root)?;
+    let rc = self.conns.entry(root).or_default();
+    run_tool(&repo, name, args, rc)
   }
 
-  fn handle(&self, msg: &Value) -> std::result::Result<Value, (i64, String)> {
+  fn handle(&mut self, msg: &Value) -> std::result::Result<Value, (i64, String)> {
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Value::Null);
     match method {
@@ -399,7 +523,8 @@ impl Server {
 const INSTRUCTIONS: &str = "Version control and file tools. Several folders may be open: call `repos` to see them and pass `repo` to choose one (the default is the folder the server started in). Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.";
 
 pub fn serve(dir: &Path) -> Result<()> {
-  let server = Server {
+  let mut server = Server {
+    conns: HashMap::new(),
     launch: repo::open(dir).ok().and_then(|r| {
       r.workdir()
         .map(|w| w.canonicalize().unwrap_or_else(|_| w.to_path_buf()))
