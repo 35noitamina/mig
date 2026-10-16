@@ -293,8 +293,22 @@ Claude Code などの AI エージェントに作業を任せる前に `mig agen
 }
 ```
 
-使えるツールは、`status`、`diff`、`log`、`context`、`save`、`undo`、`scan`、`agent_start`、`checkpoint`、`agent_finish`、`agent_abort` です。
+Claude Code には、次のコマンドで登録できます。
+
+```sh
+claude mcp add mig -- mig mcp                  # 今のプロジェクトだけ
+claude mcp add --scope user mig -- mig mcp     # どのプロジェクトでも
+```
+
+使えるツールは次のとおりです。
+
+- バージョン管理: `status`、`diff`、`log`、`context`、`save`、`undo`、`scan`
+- エージェントセッション: `agent_start`、`checkpoint`、`agent_finish`、`agent_abort`
+- ファイル操作: `ls`、`read`、`read_many`、`search`、`edit`、`write`、`move`、`delete`
+
 `save` はシークレットや巨大ファイルがあると拒否し、`diff` と `context` の出力ではシークレットを伏せ字にします。
+
+ファイル操作のツールは、標準の filesystem サーバーより少ないやり取りと文字数で使えるように作ってあります。`.gitignore` に従い、行の範囲を指定して読め、中身を正規表現で検索でき、編集は完全一致の置換（複数まとめて、全部成功か全部失敗）です。常にリポジトリの中だけを対象にし、`.git` には触れません。読むときはシークレットを `[REDACTED]` に伏せ、書き込む内容にシークレットが混ざっていたら断ります。エージェントセッションの途中なら、書き込み・移動・削除のたびに自動でチェックポイントを作るので、`agent_abort` で全部元に戻せます。
 
 ### 設定
 
@@ -449,7 +463,7 @@ mig diff    通常の unified diff
 ### 7. MCP サーバー
 
 `mig -C /path/to/repo mcp` を起動すると、標準入出力で MCP（JSON-RPC 2.0、1 行 1 メッセージ）を話します。標準出力には、プロトコルのメッセージしか出しません。
-登録例は、人間向けガイドの「MCP サーバー」を参照してください。`initialize` の `instructions` には、「`agent_start` → `checkpoint` → `agent_finish`（または `agent_abort`）の順で使うこと」と入れてあります。
+登録例は、人間向けガイドの「MCP サーバー」を参照してください。`initialize` の `instructions` には、「先に `agent_start` を呼ぶと、書き込みのたびにチェックポイントされる」「全文を読むより `search` と範囲指定の `read`、`write` より `edit`」と入れてあります。`write` / `edit` / `move` / `delete` の結果には、セッションが無いときは「元に戻せない」旨、ある時は `checkpoint <ハッシュ>` が付きます。
 
 | ツール | 引数（必須は太字） | 返すもの |
 |---|---|---|
@@ -464,6 +478,14 @@ mig diff    通常の unified diff
 | `checkpoint` | `message` | `checkpoint <ハッシュ>`、または変更が無い旨 |
 | `agent_finish` | **`message`** | 終了メッセージと新しい HEAD |
 | `agent_abort` | なし | 終了メッセージと、捨てた作業の保存先 |
+| `ls` | `path`（既定 `.`）、`depth`（1〜6、既定 1） | `.gitignore` を除いた一覧。ファイルはサイズと変更記号（`M` / `A` / `?`）つき |
+| `read` | **`path`**、`from`、`to` | 見出し1行（行数・サイズ・範囲）と、行番号つきの本文。既定は 400 行まで（上限 2000）。続きがあれば `from=` の案内が付く。バイナリと 8MB 超は本文なし。シークレットは `[REDACTED]` |
+| `read_many` | **`files`**（パス、または `{path, from, to}` の配列） | `read` をまとめた結果。失敗したファイルがあっても他は読む |
+| `search` | **`pattern`**（正規表現）、`path`、`glob`、`context`（0〜5）、`max`（既定 50）、`ignore_case` | `パス:行:本文`（前後の行は `パス-行-本文`）。2MB 超とバイナリは対象外 |
+| `edit` | **`path`**、**`edits`**（`{old, new, all}` の配列）、`dry_run` | 小さい unified diff。`old` は 1 回だけ一致する必要があり、複数あれば行番号を出して断る。シークレットらしい `new` は拒否 |
+| `write` | **`path`**、**`content`** | `created` または `overwrote`（増減行つき）。親フォルダも作る。2MB まで |
+| `move` | **`from`**、**`to`** | 移動先が既にあると失敗します |
+| `delete` | **`path`**、`recursive` | 空でないフォルダは `recursive` が必要です |
 
 ツールの失敗は、JSON-RPC のエラーではなく、結果の `isError: true` と本文のエラー文で返ります。MCP からは、push（`sync`）も `--force` も使えません。
 
@@ -513,7 +535,7 @@ cargo fmt && cargo clippy
 | `setup.rs` / `github.rs` | リポジトリの作成・リモート・GitHub への作成 |
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
-| `agent.rs` / `mcp.rs` | エージェントセッション、MCP サーバー |
+| `agent.rs` / `mcp.rs` / `files.rs` | エージェントセッション、MCP サーバー、MCP のファイル操作 |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` | GUI（画面全体、エディタ、ビュワー、ようこそ画面、設定、AI まわり） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。

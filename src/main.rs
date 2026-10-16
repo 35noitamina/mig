@@ -8,6 +8,7 @@ mod cli;
 mod config;
 #[cfg(feature = "gui")]
 mod editor;
+mod files;
 mod gc;
 mod github;
 mod growth;

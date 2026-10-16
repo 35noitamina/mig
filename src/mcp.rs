@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use crate::assist::{self, ContextOpts};
 use crate::guard::SaveBlocked;
-use crate::{agent, ai, oplog, ops, repo, rev, scan};
+use crate::{agent, ai, files, oplog, ops, repo, rev, scan};
 
 const MAX_DIFF: usize = 100_000;
 
@@ -24,6 +24,79 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str]) -> 
 fn tools() -> Vec<Value> {
   let none = json!({});
   vec![
+    tool(
+      "ls",
+      "List a folder inside the repository, honouring .gitignore. Shows sizes and change marks (M modified, A added, ? untracked).",
+      json!({
+        "path": {"type": "string", "description": "Folder, relative to the repository root (default \".\")"},
+        "depth": {"type": "integer", "minimum": 1, "maximum": 6, "description": "Levels to show (default 1)"}
+      }),
+      &[],
+    ),
+    tool(
+      "read",
+      "Read a text file with line numbers. Long files are cut; use from/to to page. Secrets are masked as [REDACTED]. Binary and huge files are not shown.",
+      json!({
+        "path": {"type": "string"},
+        "from": {"type": "integer", "minimum": 1, "description": "First line (default 1)"},
+        "to": {"type": "integer", "minimum": 1, "description": "Last line (default: 400 lines from `from`, at most 2000)"}
+      }),
+      &["path"],
+    ),
+    tool(
+      "read_many",
+      "Read several files in one call. Each entry is a path, or {path, from, to}. A failed file does not stop the others.",
+      json!({"files": {"type": "array", "items": {"anyOf": [
+        {"type": "string"},
+        {"type": "object", "properties": {"path": {"type": "string"}, "from": {"type": "integer"}, "to": {"type": "integer"}}, "required": ["path"]}
+      ]}}}),
+      &["files"],
+    ),
+    tool(
+      "search",
+      "Search file contents with a regular expression (like grep -rn), honouring .gitignore. Prints path:line:text, with path-line-text for context lines.",
+      json!({
+        "pattern": {"type": "string", "description": "Regular expression"},
+        "path": {"type": "string", "description": "Folder or file to search (default the whole repository)"},
+        "glob": {"type": "string", "description": "Only files matching this glob, e.g. \"*.rs\""},
+        "context": {"type": "integer", "minimum": 0, "maximum": 5, "description": "Lines of context around each match"},
+        "max": {"type": "integer", "minimum": 1, "maximum": 500, "description": "Stop after this many matches (default 50)"},
+        "ignore_case": {"type": "boolean"}
+      }),
+      &["pattern"],
+    ),
+    tool(
+      "edit",
+      "Replace text in a file by exact match. Every `old` must occur exactly once (or set all=true), otherwise nothing is changed. Edits apply in order, all or nothing. Returns a small diff. Refuses text that looks like a secret. Checkpoints when an agent session is active.",
+      json!({
+        "path": {"type": "string"},
+        "edits": {"type": "array", "items": {"type": "object", "properties": {
+          "old": {"type": "string", "description": "Text to find, copied without line numbers"},
+          "new": {"type": "string", "description": "Replacement (empty deletes)"},
+          "all": {"type": "boolean", "description": "Replace every occurrence"}
+        }, "required": ["old"]}},
+        "dry_run": {"type": "boolean", "description": "Show the diff without writing"}
+      }),
+      &["path", "edits"],
+    ),
+    tool(
+      "write",
+      "Create a file or replace it entirely; missing folders are created. Refuses content that looks like a secret. Prefer edit for small changes.",
+      json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+      &["path", "content"],
+    ),
+    tool(
+      "move",
+      "Move or rename a file or folder inside the repository. Fails if the destination exists.",
+      json!({"from": {"type": "string"}, "to": {"type": "string"}}),
+      &["from", "to"],
+    ),
+    tool(
+      "delete",
+      "Delete a file, or a folder with recursive=true.",
+      json!({"path": {"type": "string"}, "recursive": {"type": "boolean"}}),
+      &["path"],
+    ),
     tool(
       "status",
       "Branch, changed files and the agent session, if any.",
@@ -122,6 +195,14 @@ fn run_tool(repo: &Repository, name: &str, args: &Value) -> Result<String> {
       }
       Ok(out)
     }
+    "ls" => files::ls(repo, args),
+    "read" => files::read(repo, args),
+    "read_many" => files::read_many(repo, args),
+    "search" => files::search(repo, args),
+    "edit" => files::edit(repo, args),
+    "write" => files::write(repo, args),
+    "move" => files::move_path(repo, args),
+    "delete" => files::delete(repo, args),
     "diff" => {
       let d = match text(args, "rev") {
         Some(r) => {
@@ -230,7 +311,7 @@ fn handle(dir: &Path, msg: &Value) -> std::result::Result<Value, (i64, String)> 
       "protocolVersion": params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
       "capabilities": {"tools": {}},
       "serverInfo": {"name": "mig", "version": env!("CARGO_PKG_VERSION")},
-      "instructions": "Version control for this folder. Prefer agent_start before changing files, checkpoint after each step, and agent_finish (or agent_abort) at the end.",
+      "instructions": "Version control and file tools for this repository. Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.",
     })),
     "ping" => Ok(json!({})),
     "tools/list" => Ok(json!({"tools": tools()})),
