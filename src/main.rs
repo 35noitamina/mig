@@ -15,6 +15,11 @@ mod growth;
 mod guard;
 #[cfg(feature = "gui")]
 mod gui;
+mod live;
+#[cfg(feature = "gui")]
+mod liveui;
+#[cfg(feature = "gui")]
+mod livewatch;
 mod mcp;
 mod oplog;
 mod ops;

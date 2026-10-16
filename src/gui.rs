@@ -11,6 +11,7 @@ use git2::{DiffOptions, Oid, Repository};
 use crate::aiui::AiPanel;
 use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
+use crate::liveui::LiveView;
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
 use crate::settings::{self, Settings, SettingsDialog};
@@ -40,6 +41,7 @@ enum Mode {
   Editor,
   History,
   Size,
+  Live,
 }
 
 struct SplitDialog {
@@ -91,6 +93,7 @@ struct App {
   saving: Option<SaveJob>,
   ai: AiPanel,
   size: SizeView,
+  live: LiveView,
   agent: Option<agent::Session>,
 }
 
@@ -391,6 +394,7 @@ impl App {
     let agent = agent::session(&repo);
     let ai = AiPanel::new(root.clone(), ctx.clone());
     let size = SizeView::new(root.clone(), ctx.clone());
+    let live = LiveView::new(root.clone(), ctx.clone());
     let mut editor = Editor::new(root.clone());
     (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
     let mut app = App {
@@ -429,6 +433,7 @@ impl App {
       saving: None,
       ai,
       size,
+      live,
       agent,
     };
     app.refresh();
@@ -815,6 +820,14 @@ impl App {
       ui.separator();
       ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
       ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
+      let unseen = self.live.unseen();
+      let live_label = if unseen > 0 {
+        format!("Live ({unseen})")
+      } else {
+        "Live".to_string()
+      };
+      ui.selectable_value(&mut self.mode, Mode::Live, RichText::new(live_label).strong())
+        .on_hover_text("Watch files being written, as they happen");
       ui.selectable_value(&mut self.mode, Mode::Size, RichText::new("Size").strong())
         .on_hover_text("How big the repository got, per commit or over time");
       ui.separator();
@@ -1352,6 +1365,7 @@ impl App {
     let ctx = ctx.clone();
     self.poll_refresh(&ctx);
     self.poll_save();
+    self.live.poll(self.mode == Mode::Live);
     if self.loading.is_none() && self.last_refresh.elapsed() >= self.refresh_every {
       self.refresh();
     }
@@ -1397,6 +1411,10 @@ impl App {
     });
     match self.mode {
       Mode::History => self.history(ui),
+      Mode::Live => {
+        let session = self.agent.as_ref().map(|s| s.name.clone());
+        self.live.ui(ui, session.as_deref());
+      }
       Mode::Size => {
         let mut open = None;
         egui::CentralPanel::default_margins().show(ui, |ui| open = self.size.ui(ui, &self.repo));

@@ -220,6 +220,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。保存は Ctrl/Cmd+S です |
 | ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられます |
 | History | 履歴と差分を表示します。複数選択して Fold でき、右クリックで Reword / Split / Fold / Drop を選べます |
+| Live | リポジトリの中でファイルが書き込まれるたびに、その様子をリアルタイムで表示します。左の一覧に時刻・ファイル・`+追加行 −削除行`・やったツール（mig の MCP なら `mig edit` など、それ以外は `other`）が並び、右に差分が出ます。消えた行は赤、増えた行は緑の背景で、増えた行は書き込まれた直後に明るく光ります。**Follow** をオンにすると、書き込みのたびにそのファイルへ切り替わって、変更箇所までスクロールします。AI エージェントの作業を見守るのに向いています |
 | Size | リポジトリが大きくなってきた様子をグラフで表示します。横軸は「コミットごと」と「時間（日・週・月）」を切り替えられ、測るものはファイルの合計サイズ・ファイル数・行数から選べます。点にマウスを乗せるとコミットと増減が出て、クリックするとそのコミットを History で開きます |
 | ツールバー | Commit、Absorb、Sync、Undo、Redo、Repo メニュー（リポジトリの切り替え、GitHub への公開）、Settings |
 
@@ -495,6 +496,8 @@ mig diff    通常の unified diff
 |---|---|
 | `.git/mig/oplog.json` | undo / redo 用の操作ログ（最大 500 件） |
 | `.git/mig/agent.json` | 進行中のエージェントセッション |
+| `.git/mig/live.jsonl` | MCP のファイル操作（`edit` / `write` / `move` / `delete`）の短いログ。GUI の Live タブが「どのツールで書き込まれたか」を表示するために、直近の数秒分だけ読みます |
+| `.git/mig/growth.json` | サイズの推移の計算結果（次回は増えたコミット分だけ計算します） |
 | `refs/mig/agent/start` / `base` / `cp` | セッション開始時の HEAD、開始時の作業ツリーのスナップショット、最新のチェックポイントです。チェックポイントは `cp` から親をたどって得られます |
 | `refs/mig/saved` | 直近に捨てた（`abort` / `restore` の前の）作業のスナップショット |
 | `.mig.toml`（リポジトリ直下） | `[editor]` `[save]` `[scan]` の設定 |
@@ -531,12 +534,12 @@ cargo fmt && cargo clippy
 | `ops.rs` / `oplog.rs` | save・fold・reword・drop・branch・sync と、undo / redo の記録 |
 | `absorb.rs` / `split.rs` / `patch.rs` | absorb、split、hunk の適用 |
 | `scan.rs` / `guard.rs` | シークレットの検出と伏せ字、巨大ファイル・改行コードの検査 |
-| `gc.rs` | pack への整理と容量の集計 |
+| `gc.rs` / `growth.rs` | pack への整理と容量の集計、サイズの推移の計算 |
 | `setup.rs` / `github.rs` | リポジトリの作成・リモート・GitHub への作成 |
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
-| `agent.rs` / `mcp.rs` / `files.rs` | エージェントセッション、MCP サーバー、MCP のファイル操作 |
-| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` | GUI（画面全体、エディタ、ビュワー、ようこそ画面、設定、AI まわり） |
+| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` | エージェントセッション、MCP サーバー、MCP のファイル操作、その操作のログ |
+| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` | GUI（画面全体、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live タブ） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。
 

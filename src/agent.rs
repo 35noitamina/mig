@@ -29,6 +29,12 @@ pub fn session(repo: &Repository) -> Option<Session> {
   serde_json::from_str(&text).ok()
 }
 
+// The working tree as it was when the session started.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn base_tree(repo: &Repository) -> Option<git2::Tree<'_>> {
+  repo.find_reference(BASE).ok()?.peel_to_commit().ok()?.tree().ok()
+}
+
 fn require(repo: &Repository) -> Result<Session> {
   session(repo).ok_or_else(|| anyhow!("no agent session; start one with `mig agent start`"))
 }

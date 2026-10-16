@@ -11,7 +11,7 @@ use ignore::WalkBuilder;
 use regex::RegexBuilder;
 use serde_json::Value;
 
-use crate::{agent, guard, repo, scan};
+use crate::{agent, guard, live, repo, scan};
 
 const DEFAULT_LINES: usize = 400;
 const MAX_LINES: usize = 2000;
@@ -506,6 +506,7 @@ pub fn edit(repo: &Repository, args: &Value) -> Result<String> {
   if flag(args, "dry_run") {
     return Ok(format!("would edit {name}  +{added} -{removed}\n{patch}"));
   }
+  live::record(repo, "mig edit", &name);
   write_atomic(&path, updated.as_bytes())?;
   let note = after_write(repo, &format!("edit {name}"));
   Ok(with_note(format!("edited {name}  +{added} -{removed}\n{patch}"), note))
@@ -529,6 +530,7 @@ pub fn write(repo: &Repository, args: &Value) -> Result<String> {
   let name = rel(&root, &path);
   refuse_secrets(repo, &name, &content)?;
   let previous = std::fs::read(&path).ok();
+  live::record(repo, "mig write", &name);
   write_atomic(&path, content.as_bytes())?;
   let summary = match previous.map(String::from_utf8) {
     None => format!(
@@ -558,6 +560,8 @@ pub fn move_path(repo: &Repository, args: &Value) -> Result<String> {
   if let Some(dir) = dst.parent() {
     std::fs::create_dir_all(dir)?;
   }
+  live::record(repo, "mig move", &rel(&root, &src));
+  live::record(repo, "mig move", &rel(&root, &dst));
   std::fs::rename(&src, &dst)?;
   let summary = format!("moved {} -> {}", rel(&root, &src), rel(&root, &dst));
   Ok(with_note(summary, after_write(repo, &format!("move {from}"))))
@@ -571,6 +575,7 @@ pub fn delete(repo: &Repository, args: &Value) -> Result<String> {
     bail!("refusing to delete the repository root");
   }
   let name = rel(&root, &path);
+  live::record(repo, "mig delete", &name);
   let summary = if path.is_dir() {
     let entries = std::fs::read_dir(&path)?.count();
     if entries > 0 && !flag(args, "recursive") {
