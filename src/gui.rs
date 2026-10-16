@@ -14,6 +14,7 @@ use crate::guard::{self, SaveBlocked};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
 use crate::settings::{self, Settings, SettingsDialog};
+use crate::sizeui::SizeView;
 use crate::welcome::{self, Opened, Welcome};
 use crate::{absorb, agent, config, github, oplog, ops, repo, rev, scan, setup, split};
 
@@ -38,6 +39,7 @@ enum View {
 enum Mode {
   Editor,
   History,
+  Size,
 }
 
 struct SplitDialog {
@@ -88,6 +90,7 @@ struct App {
   auto_pending: bool,
   saving: Option<SaveJob>,
   ai: AiPanel,
+  size: SizeView,
   agent: Option<agent::Session>,
 }
 
@@ -352,6 +355,7 @@ impl App {
     let cfg = config::load_dir(&root).unwrap_or_default();
     let agent = agent::session(&repo);
     let ai = AiPanel::new(root.clone(), ctx.clone());
+    let size = SizeView::new(root.clone(), ctx.clone());
     let mut editor = Editor::new(root.clone());
     (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
     let mut app = App {
@@ -389,6 +393,7 @@ impl App {
       auto_pending: false,
       saving: None,
       ai,
+      size,
       agent,
     };
     app.refresh();
@@ -512,6 +517,24 @@ impl App {
         d.map(|d| diff_lines(&d, DIFF_LINES)).unwrap_or_default()
       }
     };
+  }
+
+  // Jumps from the size graph to a commit in the History tab.
+  fn show_commit(&mut self, oid: &str) {
+    match self.rows.iter().position(|r| r.oid.to_string() == oid) {
+      Some(i) => {
+        self.mode = Mode::History;
+        self.selected = BTreeSet::from([i]);
+        self.view = View::Commit(i);
+        self.load_diff();
+      }
+      None => {
+        self.status = Err(format!(
+          "commit {} is older than the {HISTORY} shown in History",
+          &oid[..7]
+        ));
+      }
+    }
   }
 
   fn done(&mut self, r: Result<String>) {
@@ -757,6 +780,8 @@ impl App {
       ui.separator();
       ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
       ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
+      ui.selectable_value(&mut self.mode, Mode::Size, RichText::new("Size").strong())
+        .on_hover_text("How big the repository got, per commit or over time");
       ui.separator();
       ui.label(format!("branch: {}", self.branch));
       ui.separator();
@@ -1337,6 +1362,13 @@ impl App {
     });
     match self.mode {
       Mode::History => self.history(ui),
+      Mode::Size => {
+        let mut open = None;
+        egui::CentralPanel::default_margins().show(ui, |ui| open = self.size.ui(ui, &self.repo));
+        if let Some(oid) = open {
+          self.show_commit(&oid);
+        }
+      }
       Mode::Editor => {
         if !self.findings.is_empty() {
           egui::Panel::top("editor-banner").show(ui, |ui| self.banner(ui));

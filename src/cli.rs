@@ -4,14 +4,14 @@ use std::path::PathBuf;
 
 use anyhow::{Result, anyhow};
 use chrono::{Local, TimeZone};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use git2::{DiffFormat, DiffOptions, Oid, Repository};
 
 use crate::ai::AiConfig;
 use crate::assist::ContextOpts;
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, agent, ai, assist, gc, oplog, ops, repo, rev, scan, setup, split};
+use crate::{absorb, agent, ai, assist, gc, growth, oplog, ops, repo, rev, scan, setup, split};
 
 const HELP: &str = "\
 {about}
@@ -349,8 +349,44 @@ struct CountArgs {
 
 #[derive(Args)]
 struct SizeArgs {
+  /// How many of the largest files to list
   #[arg(short = 'n', default_value_t = 10)]
   count: usize,
+  /// Show how the size changed over the history instead
+  #[arg(long)]
+  graph: bool,
+  /// Axis of the graph: one point per commit, or per day, week or month
+  #[arg(long, value_enum, default_value = "commit")]
+  by: By,
+  /// What to measure: bytes of tracked files, number of files, or lines of text
+  #[arg(long, value_enum, default_value = "size")]
+  metric: Measure,
+  /// Only the newest this many commits
+  #[arg(long, default_value_t = growth::DEFAULT_LAST)]
+  last: usize,
+  /// Print the numbers as JSON
+  #[arg(long)]
+  json: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum By {
+  Commit,
+  Day,
+  Week,
+  Month,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Measure {
+  Size,
+  Files,
+  Lines,
+}
+
+struct SizeOpts {
+  count: usize,
+  graph: Option<(By, Measure, usize, bool)>,
 }
 
 #[derive(Args)]
@@ -477,7 +513,7 @@ enum Action {
   Publish(PublishArgs),
   Scan,
   Gc,
-  Size(usize),
+  Size(SizeOpts),
   Agent(AgentCmd),
   Context(ContextOpts),
 }
@@ -571,7 +607,10 @@ impl Cmd {
       } => A::Publish(p),
       Cmd::Scan | Cmd::Repo(RepoCmd::Scan) => A::Scan,
       Cmd::Gc | Cmd::Repo(RepoCmd::Gc) => A::Gc,
-      Cmd::Size(s) | Cmd::Repo(RepoCmd::Size(s)) => A::Size(s.count),
+      Cmd::Size(s) | Cmd::Repo(RepoCmd::Size(s)) => A::Size(SizeOpts {
+        count: s.count,
+        graph: (s.graph || s.json).then_some((s.by, s.metric, s.last, s.json)),
+      }),
     };
     Ok(Top::Repo(a))
   }
@@ -860,7 +899,11 @@ fn dispatch(repo: &Repository, action: Action) -> Result<()> {
       );
       Ok(())
     }
-    Action::Size(count) => {
+    Action::Size(SizeOpts {
+      graph: Some((by, metric, last, json)),
+      ..
+    }) => size_graph(repo, by, metric, last, json),
+    Action::Size(SizeOpts { count, .. }) => {
       let r = gc::size(repo, count)?;
       println!("loose objects: {} ({})", r.loose_count, guard::fmt_size(r.loose_bytes));
       println!("packs:         {} ({})", r.pack_count, guard::fmt_size(r.pack_bytes));
@@ -1358,6 +1401,108 @@ fn run_agent(repo: &Repository, cmd: AgentCmd) -> Result<()> {
         );
       }
     },
+  }
+  Ok(())
+}
+
+const GRAPH_ROWS: usize = 40;
+const BAR_WIDTH: usize = 48;
+
+fn fmt_value(m: growth::Metric, v: u64) -> String {
+  match m {
+    growth::Metric::Bytes => guard::fmt_size(v),
+    _ => v.to_string(),
+  }
+}
+
+fn fmt_delta(m: growth::Metric, d: i64) -> String {
+  let s = fmt_value(m, d.unsigned_abs());
+  match d {
+    0 => String::new(),
+    d if d > 0 => paint("32", &format!("+{s}")),
+    _ => paint("31", &format!("-{s}")),
+  }
+}
+
+fn size_graph(repo: &Repository, by: By, measure: Measure, last: usize, json: bool) -> Result<()> {
+  use growth::{Metric, Unit};
+  let metric = match measure {
+    Measure::Size => Metric::Bytes,
+    Measure::Files => Metric::Files,
+    Measure::Lines => Metric::Lines,
+  };
+  let unit = match by {
+    By::Commit => Unit::Commit,
+    By::Day => Unit::Day,
+    By::Week => Unit::Week,
+    By::Month => Unit::Month,
+  };
+  let all = growth::history(repo)?;
+  let points = growth::tail(&all, last);
+  if points.is_empty() {
+    println!("no commits yet");
+    return Ok(());
+  }
+  // (label, summary, bytes, files, lines)
+  let rows: Vec<(String, String, u64, u64, u64)> = if unit == Unit::Commit {
+    let offset = all.len() - points.len();
+    points
+      .iter()
+      .enumerate()
+      .map(|(i, p)| {
+        (
+          format!("#{:<4} {}", offset + i + 1, &p.oid[..7]),
+          p.summary.clone(),
+          p.bytes,
+          p.files,
+          p.lines,
+        )
+      })
+      .collect()
+  } else {
+    growth::buckets(points, unit)
+      .into_iter()
+      .map(|b| (b.label, format!("{} commit(s)", b.commits), b.bytes, b.files, b.lines))
+      .collect()
+  };
+  let value = |r: &(String, String, u64, u64, u64)| match metric {
+    Metric::Bytes => r.2,
+    Metric::Files => r.3,
+    Metric::Lines => r.4,
+  };
+  if json {
+    let items: Vec<_> = rows
+      .iter()
+      .map(|r| serde_json::json!({"label": r.0.trim(), "note": r.1, "bytes": r.2, "files": r.3, "lines": r.4}))
+      .collect();
+    println!(
+      "{}",
+      serde_json::to_string_pretty(&serde_json::json!({"by": format!("{by:?}").to_lowercase(), "points": items}))?
+    );
+    return Ok(());
+  }
+  let shown = growth::thin(&rows, GRAPH_ROWS);
+  let top = shown.iter().map(&value).max().unwrap_or(0).max(1);
+  let mut prev = rows.iter().take_while(|r| r.0 != shown[0].0).last().map(&value);
+  for r in &shown {
+    let v = value(r);
+    let bar = ((v as u128 * BAR_WIDTH as u128) / top as u128) as usize;
+    let d = prev.map_or(0, |p| v as i64 - p as i64);
+    println!(
+      "{}  {}{}  {:>9} {}",
+      paint("2", &r.0),
+      paint("36", &"█".repeat(bar.max(usize::from(v > 0)))),
+      " ".repeat(BAR_WIDTH - bar.max(usize::from(v > 0))),
+      fmt_value(metric, v),
+      fmt_delta(metric, d)
+    );
+    prev = Some(v);
+  }
+  if shown.len() < rows.len() {
+    println!(
+      "{}",
+      paint("2", &format!("showing {} of {} points", shown.len(), rows.len()))
+    );
   }
   Ok(())
 }

@@ -127,6 +127,19 @@ mig gui here            # 今のフォルダのリポジトリを GUI で開く
 | `mig repo scan` | 作業ツリー全体の API キー・秘密鍵スキャン |
 | `mig repo gc` | オブジェクトをデルタ圧縮した pack にまとめ、不要なファイルを削除 |
 | `mig repo size [-n N]` | リポジトリの容量と、履歴中の大きいファイル |
+| `mig repo size --graph` | サイズの推移を棒グラフで表示（下記） |
+
+サイズの推移は、現在のブランチを最初のコミットから順にたどって、各時点で追跡されているファイルの合計を出します。計算結果は `.git/mig/growth.json` に保存されるので、2回目からは増えたコミット分だけを計算します。履歴を書き換えた（fold など）ときは自動で作り直します。
+
+```
+mig repo size --graph                         # コミットごと（既定）
+mig repo size --graph --by month              # 月ごと（day / week / month）
+mig repo size --graph --metric lines          # 行数（size / files / lines）
+mig repo size --graph --last 200              # 新しい方から200コミット（既定 1000）
+mig repo size --json --by week                # 数値を JSON で出力
+```
+
+ターミナルのグラフは40行までに間引いて表示します。行数はテキストファイルだけを数え、4MB を超えるファイルは数えません。
 
 #### AI — `mig ai`
 
@@ -224,6 +237,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。保存は Ctrl/Cmd+S です |
 | ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられます |
 | History | 履歴と差分を表示します。複数選択して Fold でき、右クリックで Reword / Split / Fold / Drop を選べます |
+| Size | リポジトリが大きくなってきた様子をグラフで表示します。横軸は「コミットごと」と「時間（日・週・月）」を切り替えられ、測るものはファイルの合計サイズ・ファイル数・行数から選べます。点にマウスを乗せるとコミットと増減が出て、クリックするとそのコミットを History で開きます |
 | ツールバー | Commit、Absorb、Sync、Undo、Redo、Repo メニュー（リポジトリの切り替え、GitHub への公開）、Settings |
 
 **自動コミット**: エディタで保存するたびに、前回のコミットからの変更行数を数えます。上限（初期値 200 行）を超えたらチェックコマンドを実行し、成功すれば `auto: ...` というメッセージで自動コミットします（push はしません）。失敗した場合はコミットせず、出力パネルにエラーを出します。
@@ -441,6 +455,7 @@ mig diff    通常の unified diff
 | 区切りを残す | `mig agent cp -m "..."` | コミットを作らない |
 | 作業の開始・終了 | `mig agent start/finish/abort` | 上の「推奨ワークフロー」 |
 | シークレット確認 | `mig repo scan` | 見つかると終了コード 1 |
+| サイズの推移 | `mig repo size --json [--by commit\|day\|week\|month]` | 各点の `bytes` / `files` / `lines`（古い順）。`--last N` で新しい方から N コミット |
 | 取り消し | `mig undo` / `mig redo` | |
 | コミットを整える | `mig h fold A..B -m "..."` / `mig h reword REV -m "..."` / `mig h drop REV` / `mig h split REV PATH…` / `mig h absorb` | `absorb -n` は何も変えず、どの変更がどのコミットに入るかだけ表示 |
 | ブランチ | `mig br new NAME` / `mig sw NAME` / `mig sw -c NAME` | |

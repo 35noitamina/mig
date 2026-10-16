@@ -10,6 +10,7 @@ mod config;
 mod editor;
 mod gc;
 mod github;
+mod growth;
 mod guard;
 #[cfg(feature = "gui")]
 mod gui;
@@ -23,6 +24,8 @@ mod scan;
 #[cfg(feature = "gui")]
 mod settings;
 mod setup;
+#[cfg(feature = "gui")]
+mod sizeui;
 mod split;
 #[cfg(feature = "gui")]
 mod viewer;
