@@ -290,6 +290,25 @@ impl eframe::App for Shell {
 }
 
 // egui's bundled fonts have no CJK glyphs; borrow one from the OS when available.
+// (ascent, descent, line gap) in em, read the way egui reads them.
+fn em_metrics(data: &[u8], index: u32) -> Option<(f32, f32, f32)> {
+  use skrifa::instance::{LocationRef, Size};
+  use skrifa::{FontRef, MetadataProvider};
+  let m = FontRef::from_index(data, index)
+    .ok()?
+    .metrics(Size::unscaled(), LocationRef::default());
+  let em = f32::from(m.units_per_em);
+  Some((m.ascent / em, m.descent / em, m.leading / em))
+}
+
+// egui centres the line box of a fallback font inside the one of the first font instead of aligning
+// baselines, so a CJK font with different vertical metrics sits too high or low. This is how far
+// (in em, downwards) its glyphs must move to share the baseline with `primary`.
+fn baseline_shift(primary: (f32, f32, f32), cjk: (f32, f32, f32)) -> f32 {
+  let height = |(a, d, g): (f32, f32, f32)| a - d + g;
+  primary.0 - cjk.0 - 0.5 * (height(primary) - height(cjk))
+}
+
 fn load_cjk_font(ctx: &egui::Context) {
   let candidates = [
     "C:/Windows/Fonts/YuGothM.ttc",
@@ -300,16 +319,32 @@ fn load_cjk_font(ctx: &egui::Context) {
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
   ];
   let Some(bytes) = candidates.iter().find_map(|p| std::fs::read(p).ok()) else {
     return;
   };
+  let cjk = em_metrics(&bytes, 0);
   let mut fonts = egui::FontDefinitions::default();
-  fonts
-    .font_data
-    .insert("cjk".into(), Arc::new(egui::FontData::from_owned(bytes)));
-  for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-    fonts.families.entry(family).or_default().push("cjk".into());
+  for (family, name) in [
+    (egui::FontFamily::Proportional, "cjk"),
+    (egui::FontFamily::Monospace, "cjk-mono"),
+  ] {
+    // Each family has its own first font, so each gets its own correction.
+    let primary = fonts
+      .families
+      .get(&family)
+      .and_then(|f| f.first())
+      .and_then(|n| fonts.font_data.get(n))
+      .and_then(|d| em_metrics(&d.font, d.index));
+    let shift = primary.zip(cjk).map_or(0.0, |(p, c)| baseline_shift(p, c));
+    let data = egui::FontData::from_owned(bytes.clone()).tweak(egui::FontTweak {
+      y_offset_factor: shift,
+      ..Default::default()
+    });
+    fonts.font_data.insert(name.into(), Arc::new(data));
+    fonts.families.entry(family).or_default().push(name.into());
   }
   ctx.set_fonts(fonts);
 }
@@ -1386,5 +1421,18 @@ impl App {
       }
     }
     self.dialogs(&ctx);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn baselines_meet() {
+    // Latin line box 0.9 above / 0.2 below, CJK 1.1 / 0.3: the CJK baseline would sit 0.05em lower.
+    let shift = baseline_shift((0.9, -0.2, 0.0), (1.1, -0.3, 0.0));
+    assert!((shift + 0.05).abs() < 1e-6);
+    assert_eq!(baseline_shift((0.9, -0.2, 0.0), (0.9, -0.2, 0.0)), 0.0);
   }
 }
