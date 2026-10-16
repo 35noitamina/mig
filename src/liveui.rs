@@ -1,15 +1,18 @@
-// The "Live" tab: every write in the repository as it happens, with the changed lines shown as a
+// Live view: every write in the open folders as it happens, with the changed lines shown as a
 // red (removed) and green (added) diff. New lines glow before settling into the normal green.
-use std::collections::VecDeque;
-use std::time::Duration;
+// One hub watches all folders; a folder's Live tab shows its part, "All folders" shows everything.
+use std::collections::{BTreeSet, VecDeque};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Vec2};
 
 use crate::livewatch::{self, CONTEXT, Event, Handle, Kind, Msg, Sign};
 
-const KEEP_EVENTS: usize = 100;
+const KEEP_EVENTS: usize = 300;
 const GLOW: Duration = Duration::from_millis(1500);
 const HOT: Duration = Duration::from_secs(2);
+const OTHER: &str = "other";
 
 enum Row {
   Line(usize),
@@ -24,23 +27,56 @@ struct Shown {
   widest: usize,
 }
 
-pub struct LiveView {
+struct Source {
+  root: PathBuf,
+  name: String,
   handle: Handle,
-  events: VecDeque<Event>,
+  note: String,
+  unseen: usize,
+  last: Option<Instant>,
+}
+
+struct Item {
+  root: PathBuf,
+  folder: String,
+  ev: Event,
+}
+
+#[derive(Clone, Copy)]
+pub enum Scope<'a> {
+  One(&'a Path),
+  All,
+}
+
+impl Scope<'_> {
+  fn covers(&self, root: &Path) -> bool {
+    match self {
+      Scope::One(r) => *r == root,
+      Scope::All => true,
+    }
+  }
+}
+
+pub struct LiveHub {
+  ctx: egui::Context,
+  sources: Vec<Source>,
+  items: VecDeque<Item>,
+  seq: u64,
   selected: Option<u64>,
   follow: bool,
   whole: bool,
-  note: String,
-  unseen: usize,
   scroll_pending: bool,
   shown: Option<Shown>,
+  agent_filter: Option<String>,
+  folder_filter: Option<PathBuf>,
 }
 
 fn rows_for(ev: &Event, whole: bool) -> Shown {
   let n = ev.lines.len();
   let changed: Vec<usize> = (0..n).filter(|&i| ev.lines[i].sign != Sign::Ctx).collect();
+  // Lines of a large file already come with only a few lines of context.
   let keep: Vec<bool> = (0..n)
-    .map(|i| !whole || !ev.whole || changed.iter().any(|&c| c.abs_diff(i) <= CONTEXT))
+    .map(|i| whole || !ev.whole || changed.iter().any(|&c| c.abs_diff(i) <= CONTEXT))
     .collect();
   let mut rows = Vec::new();
   let mut skipped = 0;
@@ -104,78 +140,148 @@ fn ranges_text(ev: &Event) -> String {
   }
 }
 
-impl LiveView {
-  pub fn new(root: std::path::PathBuf, ctx: egui::Context) -> LiveView {
-    LiveView {
-      handle: livewatch::spawn(root, ctx),
-      events: VecDeque::new(),
+fn who(ev: &Event) -> String {
+  match &ev.agent {
+    Some(a) => format!("{} · {a}", ev.tool),
+    None => ev.tool.clone(),
+  }
+}
+
+impl LiveHub {
+  pub fn new(ctx: egui::Context) -> LiveHub {
+    LiveHub {
+      ctx,
+      sources: Vec::new(),
+      items: VecDeque::new(),
+      seq: 0,
       selected: None,
       follow: true,
       whole: false,
-      note: String::new(),
-      unseen: 0,
       scroll_pending: false,
       shown: None,
+      agent_filter: None,
+      folder_filter: None,
     }
   }
 
-  // Takes in new events; call every frame, whichever tab is open.
-  pub fn poll(&mut self, visible: bool) {
-    while let Ok(m) = self.handle.rx.try_recv() {
-      match m {
-        Msg::Note(n) => self.note = n,
-        Msg::Event(ev) => {
-          if self.follow {
-            self.selected = Some(ev.id);
-            self.scroll_pending = true;
+  pub fn watch(&mut self, root: &Path, name: &str) {
+    if let Some(s) = self.sources.iter_mut().find(|s| s.root == root) {
+      s.name = name.to_string();
+      return;
+    }
+    self.sources.push(Source {
+      root: root.to_path_buf(),
+      name: name.to_string(),
+      handle: livewatch::spawn(root.to_path_buf(), self.ctx.clone()),
+      note: String::new(),
+      unseen: 0,
+      last: None,
+    });
+  }
+
+  pub fn unwatch(&mut self, root: &Path) {
+    self.sources.retain(|s| s.root != root);
+    self.items.retain(|i| i.root != root);
+  }
+
+  // Takes in new events; call every frame. `visible` is the part of the hub on screen, if any.
+  pub fn poll(&mut self, visible: Option<Scope>) {
+    for s in &mut self.sources {
+      while let Ok(m) = s.handle.rx.try_recv() {
+        match m {
+          Msg::Note(n) => s.note = n,
+          Msg::Event(mut ev) => {
+            self.seq += 1;
+            ev.id = self.seq;
+            s.last = Some(Instant::now());
+            if !visible.is_some_and(|v| v.covers(&s.root)) {
+              s.unseen += 1;
+            }
+            self.items.push_front(Item {
+              root: s.root.clone(),
+              folder: s.name.clone(),
+              ev: *ev,
+            });
           }
-          if !visible {
-            self.unseen += 1;
-          }
-          self.events.push_front(*ev);
-          self.events.truncate(KEEP_EVENTS);
         }
       }
+      if visible.is_some_and(|v| v.covers(&s.root)) {
+        s.unseen = 0;
+      }
     }
-    if visible {
-      self.unseen = 0;
+    self.items.truncate(KEEP_EVENTS);
+  }
+
+  pub fn focus_agent(&mut self, agent: Option<String>) {
+    self.agent_filter = agent;
+    self.selected = None;
+  }
+
+  pub fn unseen(&self, root: &Path) -> usize {
+    self.sources.iter().find(|s| s.root == root).map_or(0, |s| s.unseen)
+  }
+
+  pub fn unseen_all(&self) -> usize {
+    self.sources.iter().map(|s| s.unseen).sum()
+  }
+
+  pub fn hot(&self, root: &Path) -> bool {
+    self
+      .sources
+      .iter()
+      .find(|s| s.root == root)
+      .and_then(|s| s.last)
+      .is_some_and(|t| t.elapsed() < HOT)
+  }
+
+  fn matches(&self, scope: Scope, i: &Item) -> bool {
+    scope.covers(&i.root)
+      && (matches!(scope, Scope::One(_)) || self.folder_filter.as_ref().is_none_or(|f| *f == i.root))
+      && self
+        .agent_filter
+        .as_ref()
+        .is_none_or(|a| i.ev.agent.as_deref().unwrap_or(OTHER) == a)
+  }
+
+  pub fn ui(&mut self, ui: &mut egui::Ui, scope: Scope, sessions: Option<&str>) {
+    let visible: Vec<usize> = (0..self.items.len())
+      .filter(|&k| self.matches(scope, &self.items[k]))
+      .collect();
+    if self.follow
+      && let Some(&k) = visible.first()
+      && self.selected != Some(self.items[k].ev.id)
+    {
+      self.selected = Some(self.items[k].ev.id);
+      self.scroll_pending = true;
     }
-  }
-
-  pub fn unseen(&self) -> usize {
-    self.unseen
-  }
-
-  fn hot(&self) -> bool {
-    self.events.front().is_some_and(|e| e.arrived.elapsed() < HOT)
-  }
-
-  pub fn ui(&mut self, ui: &mut egui::Ui, session: Option<&str>) {
+    let hot = visible
+      .first()
+      .is_some_and(|&k| self.items[k].ev.arrived.elapsed() < HOT);
     egui::Panel::left("live-list")
       .resizable(true)
-      .default_size(340.0)
-      .show(ui, |ui| self.list(ui));
+      .default_size(360.0)
+      .show(ui, |ui| self.list(ui, scope, &visible));
     egui::CentralPanel::default_margins().show(ui, |ui| {
-      self.header(ui, session);
+      self.header(ui, scope, sessions, hot);
       ui.add_space(4.0);
-      self.diff(ui);
+      self.diff(ui, scope);
     });
-    if self.hot() || self.events.front().is_some_and(|e| e.arrived.elapsed() < GLOW) {
+    if hot {
       ui.ctx().request_repaint_after(Duration::from_millis(40));
     }
   }
 
-  fn header(&mut self, ui: &mut egui::Ui, session: Option<&str>) {
-    ui.horizontal(|ui| {
+  fn header(&mut self, ui: &mut egui::Ui, scope: Scope, sessions: Option<&str>, hot: bool) {
+    ui.horizontal_wrapped(|ui| {
       let t = ui.input(|i| i.time) as f32;
-      let live = if self.hot() {
+      let live = if hot {
         Color32::from_rgb(235, 80, 80).gamma_multiply(0.65 + 0.35 * (t * 6.0).sin().abs())
       } else {
         Color32::from_gray(130)
       };
       ui.label(RichText::new("● LIVE").color(live).strong());
-      match session {
-        Some(n) => ui.label(format!("agent session: {n}")),
+      match sessions {
+        Some(n) => ui.label(format!("agents: {n}")),
         None => ui.label(RichText::new("no agent session").weak()),
       };
       ui.separator();
@@ -189,39 +295,87 @@ impl LiveView {
       if before != self.whole {
         self.scroll_pending = true;
       }
+      ui.separator();
+      if matches!(scope, Scope::All) {
+        let label = self
+          .folder_filter
+          .as_ref()
+          .and_then(|f| self.sources.iter().find(|s| &s.root == f))
+          .map_or("All folders".to_string(), |s| s.name.clone());
+        egui::ComboBox::from_id_salt("live-folder")
+          .selected_text(label)
+          .show_ui(ui, |ui| {
+            ui.selectable_value(&mut self.folder_filter, None, "All folders");
+            for s in &self.sources {
+              ui.selectable_value(&mut self.folder_filter, Some(s.root.clone()), &s.name);
+            }
+          });
+      }
+      let agents: BTreeSet<String> = self
+        .items
+        .iter()
+        .filter(|i| scope.covers(&i.root))
+        .map(|i| i.ev.agent.clone().unwrap_or_else(|| OTHER.into()))
+        .collect();
+      egui::ComboBox::from_id_salt("live-agent")
+        .selected_text(self.agent_filter.clone().unwrap_or_else(|| "All writers".into()))
+        .show_ui(ui, |ui| {
+          ui.selectable_value(&mut self.agent_filter, None, "All writers");
+          for a in agents {
+            ui.selectable_value(&mut self.agent_filter, Some(a.clone()), a);
+          }
+        })
+        .response
+        .on_hover_text("Show only the writes of one agent (\"other\": tools other than mig)");
       if ui
         .button("Clear")
         .on_hover_text("Forget the events listed here")
         .clicked()
       {
-        self.events.clear();
+        self.items.retain(|i| !scope.covers(&i.root));
         self.selected = None;
         self.shown = None;
       }
-      if !self.note.is_empty() {
-        ui.label(RichText::new(&self.note).weak().small());
+      let notes: Vec<String> = self
+        .sources
+        .iter()
+        .filter(|s| scope.covers(&s.root) && !s.note.is_empty())
+        .map(|s| {
+          if matches!(scope, Scope::All) {
+            format!("{}: {}", s.name, s.note)
+          } else {
+            s.note.clone()
+          }
+        })
+        .collect();
+      if !notes.is_empty() {
+        ui.label(RichText::new(notes.join(" · ")).weak().small());
       }
     });
   }
 
-  fn list(&mut self, ui: &mut egui::Ui) {
-    if self.events.is_empty() {
+  fn list(&mut self, ui: &mut egui::Ui, scope: Scope, visible: &[usize]) {
+    if visible.is_empty() {
       ui.add_space(12.0);
       ui.label(RichText::new("Waiting for writes…").weak());
       ui.label(
-        RichText::new("Changes made in this repository, by an AI agent or any other tool, appear here as they happen.")
-          .weak()
-          .small(),
+        RichText::new(
+          "Changes made in the open folders, by an AI agent or any other tool, appear here as they happen.",
+        )
+        .weak()
+        .small(),
       );
       return;
     }
+    let all = matches!(scope, Scope::All);
     let mut clicked = None;
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-      for ev in &self.events {
+      for &k in visible {
+        let item = &self.items[k];
+        let ev = &item.ev;
         let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 42.0), Sense::click());
         let p = ui.painter();
-        let selected = self.selected == Some(ev.id);
-        if selected {
+        if self.selected == Some(ev.id) {
           p.rect_filled(rect, 4.0, ui.visuals().selection.bg_fill.gamma_multiply(0.6));
         } else if resp.hovered() {
           p.rect_filled(rect, 4.0, ui.visuals().widgets.hovered.weak_bg_fill);
@@ -237,10 +391,15 @@ impl LiveView {
         let text = ui.visuals().text_color();
         let small = FontId::monospace(11.0);
         let clipped = p.with_clip_rect(rect.shrink2(Vec2::new(8.0, 0.0)));
+        let folder = if all {
+          format!("  [{}]", item.folder)
+        } else {
+          String::new()
+        };
         clipped.text(
           rect.min + Vec2::new(10.0, 4.0),
           Align2::LEFT_TOP,
-          format!("{}  {}", ev.at.format("%H:%M:%S"), kind_label(ev.kind)),
+          format!("{}  {}{folder}", ev.at.format("%H:%M:%S"), kind_label(ev.kind)),
           small.clone(),
           weak,
         );
@@ -259,9 +418,9 @@ impl LiveView {
         clipped.text(
           egui::pos2(rect.right() - 10.0, rect.top() + 4.0),
           Align2::RIGHT_TOP,
-          format!("{stat}  {}", ev.tool),
+          format!("{stat}  {}", who(ev)),
           small,
-          if ev.tool == "other" {
+          if ev.tool == OTHER {
             weak
           } else {
             Color32::from_rgb(110, 170, 235)
@@ -279,12 +438,20 @@ impl LiveView {
     }
   }
 
-  fn diff(&mut self, ui: &mut egui::Ui) {
-    let Some(ev) = self.selected.and_then(|id| self.events.iter().find(|e| e.id == id)) else {
+  fn diff(&mut self, ui: &mut egui::Ui, scope: Scope) {
+    let Some(item) = self
+      .selected
+      .and_then(|id| self.items.iter().find(|i| i.ev.id == id))
+      .filter(|i| scope.covers(&i.root))
+    else {
       ui.label(RichText::new("No write selected").weak());
       return;
     };
+    let ev = &item.ev;
     ui.horizontal(|ui| {
+      if matches!(scope, Scope::All) {
+        ui.label(RichText::new(&item.folder).weak());
+      }
       ui.label(RichText::new(&ev.path).strong().monospace());
       ui.label(RichText::new(format!("{}  ·  {}", kind_label(ev.kind), ranges_text(ev))).weak());
     });
@@ -293,7 +460,7 @@ impl LiveView {
         "+{} −{}  ·  {}  ·  {}",
         ev.added,
         ev.removed,
-        ev.tool,
+        who(ev),
         ev.at.format("%H:%M:%S")
       ))
       .weak()

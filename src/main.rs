@@ -1,5 +1,7 @@
 mod absorb;
 mod agent;
+#[cfg(feature = "gui")]
+mod agentsui;
 mod ai;
 #[cfg(feature = "gui")]
 mod aiui;

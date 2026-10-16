@@ -55,6 +55,8 @@ pub struct Event {
   pub path: String,
   pub kind: Kind,
   pub tool: String,
+  // The agent session that wrote it through mig, if any.
+  pub agent: Option<String>,
   pub added: usize,
   pub removed: usize,
   pub binary: bool,
@@ -190,7 +192,8 @@ impl State {
   fn event(&mut self, rel: &str, kind: Kind, old: &str, new: &str) -> Option<Event> {
     let whole = old.len().max(new.len()) <= WHOLE_MAX;
     let d = diff(old, new, rel, whole).ok()?;
-    let tool = live::recent(self.repo.path(), rel, TOOL_WINDOW_MS).map_or("other".to_string(), |e| e.tool);
+    let by = live::recent(self.repo.path(), rel, TOOL_WINDOW_MS);
+    let (tool, agent) = by.map_or(("other".to_string(), None), |e| (e.tool, e.agent));
     self.next_id += 1;
     Some(Event {
       id: self.next_id,
@@ -199,6 +202,7 @@ impl State {
       path: rel.to_string(),
       kind,
       tool,
+      agent,
       added: d.added,
       removed: d.removed,
       binary: false,
@@ -225,6 +229,8 @@ impl State {
       std::fs::read(p).ok()?
     };
     if meta.len() > MAX_TEXT || is_binary(&bytes) {
+      let (tool, agent) =
+        live::recent(self.repo.path(), &rel, TOOL_WINDOW_MS).map_or(("other".to_string(), None), |e| (e.tool, e.agent));
       self.next_id += 1;
       return Some(Event {
         id: self.next_id,
@@ -236,7 +242,8 @@ impl State {
         } else {
           Kind::Created
         },
-        tool: live::recent(self.repo.path(), &rel, TOOL_WINDOW_MS).map_or("other".to_string(), |e| e.tool),
+        tool,
+        agent,
         added: 0,
         removed: 0,
         binary: true,
@@ -328,6 +335,16 @@ fn run(root: PathBuf, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: eframe::egui:
     for p in batch {
       if p.is_dir() {
         watch_dirs(&mut watcher, &p, &mut watched);
+        // Files written before the new folder was watched would be missed otherwise.
+        let inside = WalkBuilder::new(&p)
+          .hidden(false)
+          .filter_entry(|e| e.file_name() != ".git")
+          .build();
+        for f in inside.flatten().filter(|e| e.file_type().is_some_and(|t| t.is_file())) {
+          if let Some(ev) = state.changed(f.path()) {
+            sent |= tx.send(Msg::Event(Box::new(ev))).is_ok();
+          }
+        }
         continue;
       }
       if let Some(ev) = state.changed(&p) {

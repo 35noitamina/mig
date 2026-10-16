@@ -479,7 +479,9 @@ fn apply_edits(original: &str, edits: &[Edit]) -> Result<String> {
       bail!(msg);
     }
     if at.len() > 1 && !e.all {
-      let lines: Vec<String> = at.iter().take(6).map(|&i| line_of(&cur, i).to_string()).collect();
+      let mut lines: Vec<usize> = at.iter().map(|&i| line_of(&cur, i)).collect();
+      lines.dedup();
+      let lines: Vec<String> = lines.iter().take(6).map(usize::to_string).collect();
       bail!(
         "edit {}: the text occurs {} times (lines {}); add more surrounding text or set all=true. Nothing was changed.",
         k + 1,

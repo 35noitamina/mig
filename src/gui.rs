@@ -8,16 +8,17 @@ use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
 use git2::{DiffOptions, Oid, Repository};
 
+use crate::agentsui::{self, AgentsView};
 use crate::aiui::AiPanel;
 use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
-use crate::liveui::LiveView;
+use crate::liveui::{LiveHub, Scope};
 use crate::repo::Change;
 use crate::scan::{Finding, SecretsFound};
 use crate::settings::{self, Settings, SettingsDialog};
 use crate::sizeui::SizeView;
 use crate::welcome::{self, Opened, Welcome};
-use crate::{absorb, agent, config, github, oplog, ops, repo, rev, scan, setup, split};
+use crate::{absorb, agent, config, github, oplog, ops, repo, rev, scan, setup, split, workspace};
 
 const HISTORY: usize = 300;
 const REFRESH: Duration = Duration::from_secs(3);
@@ -93,7 +94,7 @@ struct App {
   saving: Option<SaveJob>,
   ai: AiPanel,
   size: SizeView,
-  live: LiveView,
+  live_unseen: usize,
   agents: Vec<agent::Session>,
 }
 
@@ -228,10 +229,14 @@ pub fn run(dir: PathBuf, open: Option<PathBuf>) -> Result<()> {
       load_cjk_font(&cc.egui_ctx);
       Settings::load().apply(&cc.egui_ctx);
       egui_extras::install_image_loaders(&cc.egui_ctx);
-      let mut shell = Shell {
-        app: None,
-        welcome: Welcome::new(Some(dir), None).with_info(note),
-      };
+      let mut shell = Shell::new(&cc.egui_ctx, Welcome::new(Some(dir), None).with_info(note));
+      for w in workspace::load() {
+        if let Ok(i) = shell.add(&cc.egui_ctx, &w)
+          && shell.page == Page::Welcome
+        {
+          shell.page = Page::Folder(i);
+        }
+      }
       if let Some(root) = start {
         shell.open(
           &cc.egui_ctx,
@@ -248,29 +253,218 @@ pub fn run(dir: PathBuf, open: Option<PathBuf>) -> Result<()> {
   .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Page {
+  Folder(usize),
+  AllLive,
+  Agents,
+  Welcome,
+}
+
+// One window for every open folder: a rail on the left switches between them, the live view of
+// all folders and the agents page.
 struct Shell {
-  app: Option<App>,
+  apps: Vec<App>,
+  names: Vec<String>,
+  page: Page,
   welcome: Welcome,
+  hub: LiveHub,
+  agents: AgentsView,
+  rename: Option<(usize, String)>,
 }
 
 impl Shell {
+  fn new(ctx: &egui::Context, welcome: Welcome) -> Shell {
+    Shell {
+      apps: Vec::new(),
+      names: Vec::new(),
+      page: Page::Welcome,
+      welcome,
+      hub: LiveHub::new(ctx.clone()),
+      agents: AgentsView::default(),
+      rename: None,
+    }
+  }
+
+  fn folders(&self) -> Vec<(PathBuf, String)> {
+    self
+      .apps
+      .iter()
+      .zip(&self.names)
+      .map(|(a, n)| (a.root.clone(), n.clone()))
+      .collect()
+  }
+
+  // Opens a folder that is already in the list (at startup).
+  fn add(&mut self, ctx: &egui::Context, w: &workspace::Workspace) -> Result<usize> {
+    if let Some(i) = self.apps.iter().position(|a| workspace::same(&a.root, &w.path)) {
+      return Ok(i);
+    }
+    let app = App::open(&w.path, ctx)?;
+    self.hub.watch(&app.root, &w.name);
+    self.apps.push(app);
+    self.names.push(w.name.clone());
+    Ok(self.apps.len() - 1)
+  }
+
   fn open(&mut self, ctx: &egui::Context, o: Opened) {
-    match App::open(&o.dir, ctx) {
-      Ok(mut app) => {
-        welcome::remember(&app.root);
-        let name = app
-          .root
-          .file_name()
-          .map(|n| n.to_string_lossy().into_owned())
-          .unwrap_or_default();
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!("mig — {name}")));
+    let r = workspace::add(&o.dir, None).and_then(|w| {
+      welcome::remember(&w.path);
+      self.add(ctx, &w)
+    });
+    match r {
+      Ok(i) => {
+        let app = &mut self.apps[i];
         if !o.status.is_empty() {
           app.status = Ok(o.status);
         }
-        app.confirm_save = o.blocked;
-        self.app = Some(app);
+        if o.blocked.is_some() {
+          app.confirm_save = o.blocked;
+        }
+        self.page = Page::Folder(i);
       }
-      Err(e) => self.welcome = Welcome::new(Some(o.dir), Some(format!("{e:#}"))),
+      Err(e) => {
+        self.welcome = Welcome::new(Some(o.dir), Some(format!("{e:#}")));
+        self.page = Page::Welcome;
+      }
+    }
+  }
+
+  fn close(&mut self, i: usize) {
+    let root = self.apps[i].root.clone();
+    let _ = workspace::remove(&root.to_string_lossy());
+    self.hub.unwatch(&root);
+    self.apps.remove(i);
+    self.names.remove(i);
+    self.page = match self.page {
+      _ if self.apps.is_empty() => Page::Welcome,
+      Page::Folder(j) if j == i => Page::Folder(i.min(self.apps.len() - 1)),
+      Page::Folder(j) if j > i => Page::Folder(j - 1),
+      p => p,
+    };
+  }
+
+  fn title(&self) -> String {
+    match self.page {
+      Page::Folder(i) => format!("mig — {}", self.names[i]),
+      Page::AllLive => "mig — Live".into(),
+      Page::Agents => "mig — Agents".into(),
+      Page::Welcome => "mig".into(),
+    }
+  }
+
+  fn rail(&mut self, ui: &mut egui::Ui) {
+    let accent = Color32::from_rgb(140, 180, 230);
+    ui.add_space(6.0);
+    let all = self.hub.unseen_all();
+    let label = if all > 0 && self.page != Page::AllLive {
+      format!("Live — all folders ({all})")
+    } else {
+      "Live — all folders".into()
+    };
+    if ui
+      .selectable_label(self.page == Page::AllLive, label)
+      .on_hover_text("Every write in every open folder, as it happens")
+      .clicked()
+    {
+      self.page = Page::AllLive;
+    }
+    let n = self.agents.count();
+    let label = if n > 0 {
+      format!("Agents ({n})")
+    } else {
+      "Agents".into()
+    };
+    if ui
+      .selectable_label(
+        self.page == Page::Agents,
+        RichText::new(label).color(if n > 0 { accent } else { ui.visuals().text_color() }),
+      )
+      .on_hover_text("Agent sessions in all open folders")
+      .clicked()
+    {
+      self.page = Page::Agents;
+    }
+    ui.separator();
+    ui.label(RichText::new("Folders").weak().small());
+    let mut close = None;
+    for i in 0..self.apps.len() {
+      let root = self.apps[i].root.clone();
+      let mut text = self.names[i].clone();
+      let unseen = self.hub.unseen(&root);
+      if self.hub.hot(&root) {
+        text.push_str("  ●");
+      } else if unseen > 0 {
+        text.push_str(&format!("  ({unseen})"));
+      }
+      let agents = self.agents.count_in(&root);
+      if agents > 0 {
+        text.push_str(&format!("  · {agents} agent{}", if agents == 1 { "" } else { "s" }));
+      }
+      let r = ui
+        .selectable_label(self.page == Page::Folder(i), text)
+        .on_hover_text(root.display().to_string());
+      if r.clicked() {
+        self.page = Page::Folder(i);
+      }
+      r.context_menu(|ui| {
+        if ui.button("Rename…").clicked() {
+          self.rename = Some((i, self.names[i].clone()));
+          ui.close();
+        }
+        if ui
+          .button("Close")
+          .on_hover_text("Remove from this window and from the folders AI tools may use (files are not touched)")
+          .clicked()
+        {
+          close = Some(i);
+          ui.close();
+        }
+      });
+    }
+    if let Some(i) = close {
+      self.close(i);
+    }
+    ui.add_space(6.0);
+    if ui
+      .button("+ Open folder…")
+      .on_hover_text("Open or create a repository in this window")
+      .clicked()
+    {
+      self.welcome = Welcome::new(None, None);
+      self.page = Page::Welcome;
+    }
+  }
+
+  fn rename_dialog(&mut self, ctx: &egui::Context) {
+    let Some((i, mut name)) = self.rename.take() else {
+      return;
+    };
+    let (mut go, mut keep) = (false, true);
+    egui::Window::new("Rename folder")
+      .collapsible(false)
+      .pivot(egui::Align2::CENTER_CENTER)
+      .default_pos(ctx.content_rect().center())
+      .show(ctx, |ui| {
+        ui.label("The name AI tools use for this folder (the `repo` argument).");
+        let r = ui.text_edit_singleline(&mut name);
+        go = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        ui.horizontal(|ui| {
+          keep = !ui.button("Cancel").clicked();
+          go |= ui.button("Rename").clicked();
+        });
+      });
+    if go {
+      let root = self.apps[i].root.clone();
+      match workspace::rename(&root.to_string_lossy(), name.trim()) {
+        Ok(()) => {
+          self.names[i] = name.trim().to_string();
+          self.hub.watch(&root, name.trim());
+        }
+        Err(e) => self.apps[i].status = Err(format!("{e:#}")),
+      }
+    } else if keep {
+      self.rename = Some((i, name));
     }
   }
 }
@@ -278,17 +472,76 @@ impl Shell {
 impl eframe::App for Shell {
   fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
     let ctx = ui.ctx().clone();
-    if let Some(app) = &mut self.app {
-      app.frame(ui, &ctx);
-      if app.leave {
-        let root = app.root.clone();
-        self.app = None;
-        self.welcome = Welcome::new(root.parent().map(Path::to_path_buf), None);
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title("mig".into()));
-      }
-    } else if let Some(o) = self.welcome.ui(ui) {
-      self.open(&ctx, o);
+    let visible = match self.page {
+      Page::Folder(i) if self.apps[i].mode == Mode::Live => Some(Scope::One(&self.apps[i].root)),
+      Page::AllLive => Some(Scope::All),
+      _ => None,
+    };
+    let visible = visible.map(|v| match v {
+      Scope::One(r) => (Some(r.to_path_buf()), true),
+      Scope::All => (None, true),
+    });
+    match &visible {
+      Some((Some(r), _)) => self.hub.poll(Some(Scope::One(r))),
+      Some((None, _)) => self.hub.poll(Some(Scope::All)),
+      None => self.hub.poll(None),
     }
+    let folders = self.folders();
+    self.agents.refresh(&folders, false);
+    for (i, app) in self.apps.iter_mut().enumerate() {
+      app.live_unseen = self.hub.unseen(&app.root);
+      let _ = i;
+    }
+    let title = self.title();
+    ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+
+    if !self.apps.is_empty() {
+      egui::Panel::left("rail")
+        .resizable(true)
+        .default_size(190.0)
+        .show(ui, |ui| self.rail(ui));
+    }
+    match self.page {
+      Page::Folder(i) => {
+        let app = &mut self.apps[i];
+        app.frame(ui, &ctx, &mut self.hub);
+        if app.leave {
+          app.leave = false;
+          self.welcome = Welcome::new(app.root.parent().map(Path::to_path_buf), None);
+          self.page = Page::Welcome;
+        }
+      }
+      Page::AllLive => {
+        let names: Vec<String> = self
+          .apps
+          .iter()
+          .flat_map(|a| a.agents.iter().map(|s| s.name.clone()))
+          .collect();
+        let sessions = (!names.is_empty()).then(|| names.join(", "));
+        self.hub.ui(ui, Scope::All, sessions.as_deref());
+      }
+      Page::Agents => match self.agents.ui(ui, &folders) {
+        Some(agentsui::Action::Live { root, agent }) => {
+          self.hub.focus_agent(Some(agent));
+          if let Some(i) = self.apps.iter().position(|a| a.root == root) {
+            self.apps[i].mode = Mode::Live;
+            self.page = Page::Folder(i);
+          }
+        }
+        Some(agentsui::Action::Changed) => {
+          for app in &mut self.apps {
+            app.refresh();
+          }
+        }
+        None => {}
+      },
+      Page::Welcome => {
+        if let Some(o) = self.welcome.ui(ui) {
+          self.open(&ctx, o);
+        }
+      }
+    }
+    self.rename_dialog(&ctx);
   }
 }
 
@@ -394,7 +647,6 @@ impl App {
     let agents = agent::list(&repo);
     let ai = AiPanel::new(root.clone(), ctx.clone());
     let size = SizeView::new(root.clone(), ctx.clone());
-    let live = LiveView::new(root.clone(), ctx.clone());
     let mut editor = Editor::new(root.clone());
     (editor.check_cmd, editor.run_cmd) = config::commands(&root, &cfg.editor);
     let mut app = App {
@@ -433,7 +685,7 @@ impl App {
       saving: None,
       ai,
       size,
-      live,
+      live_unseen: 0,
       agents,
     };
     app.refresh();
@@ -756,7 +1008,7 @@ impl App {
   }
 
   fn toolbar(&mut self, ui: &mut egui::Ui) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
       ui.menu_button("Repo", |ui| {
         if ui
           .button("Open / new repository…")
@@ -821,7 +1073,7 @@ impl App {
       ui.separator();
       ui.selectable_value(&mut self.mode, Mode::Editor, RichText::new("Editor").strong());
       ui.selectable_value(&mut self.mode, Mode::History, RichText::new("History").strong());
-      let unseen = self.live.unseen();
+      let unseen = self.live_unseen;
       let live_label = if unseen > 0 {
         format!("Live ({unseen})")
       } else {
@@ -1377,11 +1629,10 @@ fn notify(summary: &str, body: &str) {
 }
 
 impl App {
-  fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+  fn frame(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, hub: &mut LiveHub) {
     let ctx = ctx.clone();
     self.poll_refresh(&ctx);
     self.poll_save();
-    self.live.poll(self.mode == Mode::Live);
     if self.loading.is_none() && self.last_refresh.elapsed() >= self.refresh_every {
       self.refresh();
     }
@@ -1436,7 +1687,8 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ")
         });
-        self.live.ui(ui, session.as_deref());
+        let root = self.root.clone();
+        hub.ui(ui, Scope::One(&root), session.as_deref());
       }
       Mode::Size => {
         let mut open = None;
