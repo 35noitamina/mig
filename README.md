@@ -227,7 +227,9 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 
 | 画面 | できること |
 |---|---|
-| Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。保存は Ctrl/Cmd+S です |
+| Editor | ファイルツリー、タブ、シンタックスハイライト、実行（F5／停止 Shift+F5）。保存は Ctrl/Cmd+S です。色付けは bat の構文セット（200 以上）で、TypeScript、TOML、Kotlin、Swift、Dockerfile、Vue、Svelte なども対応します。拡張子、ファイル名（`Dockerfile`、`Makefile` など）、1 行目の `#!` の順に判定します |
+| ファイル内検索 | **Ctrl/Cmd+F** で、エディタの上に検索バーが出ます。入力するたびに全部の一致を黄色で示し、今の一致は濃い色で、そこまでスクロールします。**Enter / F3** で次、**Shift+Enter / Shift+F3** で前、**Esc** で閉じます（閉じたとき、今の一致を選択した状態になります）。**Aa** で大文字小文字を区別、**.\*** で正規表現です。選択している文字があれば、最初の検索語になります |
+| リポジトリ内検索 | **Ctrl/Cmd+Shift+F** で、下のパネルの **Search** が開きます。検索語（**Aa** / **.\***）とファイルの絞り込み（`*.rs` など）を入れて Enter で、`.gitignore` に従ってすべてのファイルを探します（バイナリと 2MB を超えるファイルは対象外、結果は 2000 件まで）。開いている未保存のタブは、その内容を探します。結果の行をクリックすると、そのファイルを開いて、一致を選択します |
 | ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられます |
 | History | 履歴と差分を表示します。複数選択して Fold でき、右クリックで Reword / Split / Fold / Drop を選べます |
 | Live | リポジトリの中でファイルが書き込まれるたびに、その様子をリアルタイムで表示します。左の一覧に時刻・ファイル・`+追加行 −削除行`・やったツールとエージェント（mig の MCP なら `mig edit · alice` など、それ以外は `other`）が並び、右に差分が出ます。消えた行は赤、増えた行は緑の背景で、増えた行は書き込まれた直後に明るく光ります。**Follow** をオンにすると、書き込みのたびにそのファイルへ切り替わって、変更箇所までスクロールします。AI エージェントの作業を見守るのに向いています |
@@ -572,7 +574,7 @@ cargo fmt && cargo clippy
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
 | `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧 |
-| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents） |
+| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。
 

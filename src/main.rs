@@ -11,12 +11,16 @@ mod config;
 #[cfg(feature = "gui")]
 mod editor;
 mod files;
+#[cfg(feature = "gui")]
+mod finder;
 mod gc;
 mod github;
 mod growth;
 mod guard;
 #[cfg(feature = "gui")]
 mod gui;
+#[cfg(feature = "gui")]
+mod highlight;
 mod live;
 #[cfg(feature = "gui")]
 mod liveui;
