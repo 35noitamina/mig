@@ -29,6 +29,7 @@ mod live;
 mod liveui;
 #[cfg(feature = "gui")]
 mod livewatch;
+mod lock;
 mod mcp;
 mod oplog;
 mod ops;

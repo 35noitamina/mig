@@ -62,6 +62,7 @@ For AI tools:
   mcp                Run as an MCP server over stdio
   ws                 Folders the GUI window and the MCP server work in (ls, add, rm, rename)
   run                Run a command or script through mig's safety check (exec, script, check, log, pending, approve, deny)
+  lock, unlock       Take Claude Code's own command tools away in this repository (or give them back)
 
 GUI:
   gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
@@ -166,6 +167,20 @@ enum Cmd {
   /// Run a command or script through the same safety check AI agents go through
   #[command(subcommand)]
   Run(RunCmd),
+  /// Take Claude Code's own command tools (Bash, PowerShell, Monitor) away in this repository
+  Lock {
+    /// Write to .claude/settings.json (shared with the team) instead of settings.local.json
+    #[arg(long)]
+    shared: bool,
+    /// Name the mig MCP server is registered under in Claude Code
+    #[arg(long, default_value = "mig")]
+    server: String,
+    /// Only show whether the repository is locked
+    #[arg(long)]
+    status: bool,
+  },
+  /// Give Claude Code's command tools back
+  Unlock,
 
   // Earlier top-level spellings, kept working but out of the help.
   #[command(hide = true)]
@@ -601,6 +616,8 @@ enum Action {
   Agent(AgentCmd),
   Context(ContextOpts),
   Run(RunCmd),
+  Lock { shared: bool, server: String, status: bool },
+  Unlock,
 }
 
 enum Top {
@@ -624,6 +641,8 @@ impl Cmd {
       Cmd::Ws(w) => return Ok(Top::Ws(w)),
       Cmd::Agent(a) => A::Agent(a),
       Cmd::Run(r) => A::Run(r),
+      Cmd::Lock { shared, server, status } => A::Lock { shared, server, status },
+      Cmd::Unlock => A::Unlock,
       Cmd::Context { diff, files, count } => A::Context(ContextOpts {
         diff,
         files,
@@ -1023,6 +1042,12 @@ fn dispatch(repo: &Repository, action: Action) -> Result<()> {
     }
     Action::Agent(cmd) => run_agent(repo, cmd),
     Action::Run(cmd) => run_run(repo, cmd),
+    Action::Lock { shared, server, status } => run_lock(repo, &server, shared, status),
+    Action::Unlock => {
+      let file = crate::lock::unlock(repo)?;
+      println!("unlocked: removed what mig added to {file}");
+      Ok(())
+    }
     Action::Context(opts) => {
       let (text, redacted) = assist::context(repo, &opts)?;
       print!("{text}");
@@ -1757,5 +1782,40 @@ fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
       }
     }
   }
+  Ok(())
+}
+
+fn run_lock(repo: &Repository, server: &str, shared: bool, status: bool) -> Result<()> {
+  let show = |state: &crate::lock::State| {
+    if state.files.is_empty() {
+      println!("not locked: Claude Code can still run commands with its own tools here");
+    } else {
+      println!(
+        "locked: Bash is denied in {}{}",
+        state.files.join(", "),
+        if state.by_mig {
+          ""
+        } else {
+          " (by your own settings, not by mig lock)"
+        }
+      );
+    }
+    if state.mcp.is_empty() {
+      println!(
+        "{} the mig MCP server \"{server}\" is not registered for Claude Code. Without it, Claude has no way to run commands here. Register it with:\n  claude mcp add --scope user {server} -- mig mcp",
+        paint("33", "warning:")
+      );
+    } else {
+      println!("mig MCP server \"{server}\": {}", state.mcp.join(", "));
+    }
+  };
+  if !status {
+    let l = crate::lock::lock(repo, server, shared)?;
+    println!(
+      "locked: {} rule(s) added to {}\nClaude Code now has no Bash, PowerShell or Monitor tool here; it runs commands with mig's run and run_script. Start Claude Code again (or /mcp reconnect) for it to take effect.",
+      l.added, l.file
+    );
+  }
+  show(&crate::lock::state(repo, server));
   Ok(())
 }

@@ -163,6 +163,20 @@ AI エージェントが MCP の `run` / `run_script` で通る検査と同じ�
 | `mig run pending` | 人間の承認を待っている実行の一覧（`.mig.toml` で `mode = "ask"` か `"strict"` のとき） |
 | `mig run approve ID [--always]` / `mig run deny ID` | 待っている実行を進める（`--always` は、その正確なコマンドを今後は確認なしにする）／断る |
 
+#### Claude Code のコマンド実行を止める — `mig lock`
+
+| コマンド | 内容 |
+|---|---|
+| `mig lock [--shared] [--server NAME]` | このリポジトリで、Claude Code 自身のコマンドの道具（Bash、PowerShell、Monitor）を使えなくします。コマンドは mig の `run` / `run_script` を通るようになります |
+| `mig lock --status` | ロックされているか、mig の MCP サーバーが Claude Code に登録されているかを表示 |
+| `mig unlock` | mig が足した設定だけを取り除いて、元に戻します |
+
+`.claude/settings.local.json`（自分だけ。git には入りません）に、`permissions.deny` として `Bash`、`PowerShell`、`Monitor`、`Edit(.claude/**)`、`Edit(.mcp.json)`、`Edit(.mig.toml)` を、`permissions.allow` として `mcp__mig__run` / `mcp__mig__run_script` / `mcp__mig__run_check` を足します。`--shared` なら `.claude/settings.json`（チームで共有）に書きます。MCP サーバーを `mig` 以外の名前で登録しているときは、`--server` で名前を渡します。足した項目は `.git/mig/lock.json` に控えるので、`unlock` はそれだけを消します（元からあった同じ項目や、他の設定には触りません）。
+
+Claude Code は、起動し直す（または `/mcp` で再接続する）と反映されます。デスクトップアプリも、同じ設定ファイルを読みます。GUI では、左のフォルダ一覧を右クリックして **Lock Claude's shell** / **Unlock Claude's shell** でも切り替えられ、ロック中のフォルダには `· locked` と出ます。
+
+ロックの前に、mig の MCP サーバーを Claude Code に登録してください（`claude mcp add --scope user mig -- mig mcp`）。登録していないと、Claude はそのリポジトリでコマンドを何も実行できなくなります（`mig lock` は、登録が見つからないときに警告します）。
+
 #### AI ツール向け
 
 | コマンド | 内容 |
@@ -580,6 +594,7 @@ mig diff    通常の unified diff
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
 | `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/lock.json` | `mig lock` が Claude Code の設定に足した項目（`unlock` で、これだけを消すため） |
 | `.git/mig/run-allow.json` | 「Always allow」で覚えた実行（正確なコマンドの指紋） |
 | `.git/mig/live.jsonl` | MCP のファイル操作（`edit` / `write` / `move` / `delete`）の短いログ。GUI の Live タブが「どのツールで書き込まれたか」を表示するために、直近の数秒分だけ読みます |
 | `.git/mig/growth.json` | サイズの推移の計算結果（次回は増えたコミット分だけ計算します） |
@@ -624,7 +639,7 @@ cargo fmt && cargo clippy
 | `setup.rs` / `github.rs` | リポジトリの作成・リモート・GitHub への作成 |
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
-| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
+| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` / `lock.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。

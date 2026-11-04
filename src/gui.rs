@@ -97,6 +97,7 @@ struct App {
   size: SizeView,
   live_unseen: usize,
   agents: Vec<agent::Session>,
+  lock_seen: Option<(Instant, bool, bool)>,
 }
 
 struct SaveJob {
@@ -419,6 +420,10 @@ impl Shell {
       } else if unseen > 0 {
         text.push_str(&format!("  ({unseen})"));
       }
+      let (locked, _) = self.apps[i].lock_state();
+      if locked {
+        text.push_str("  · locked");
+      }
       let agents = self.agents.count_in(&root);
       if agents > 0 {
         text.push_str(&format!("  · {agents} agent{}", if agents == 1 { "" } else { "s" }));
@@ -429,7 +434,33 @@ impl Shell {
       if r.clicked() {
         self.page = Page::Folder(i);
       }
+      let (locked, by_mig) = self.apps[i].lock_state();
       r.context_menu(|ui| {
+        if locked && !by_mig {
+          ui.label(
+            RichText::new("Claude's shell is blocked by your own settings")
+              .weak()
+              .small(),
+          );
+        } else if locked {
+          if ui
+            .button("Unlock Claude's shell")
+            .on_hover_text("Give Claude Code its own Bash / PowerShell / Monitor tools back in this folder")
+            .clicked()
+          {
+            self.apps[i].set_lock(false);
+            ui.close();
+          }
+        } else if ui
+          .button("Lock Claude's shell")
+          .on_hover_text(
+            "Take Claude Code's own command tools away here, so commands go through mig's checked run tools",
+          )
+          .clicked()
+        {
+          self.apps[i].set_lock(true);
+          ui.close();
+        }
         if ui.button("Rename…").clicked() {
           self.rename = Some((i, self.names[i].clone()));
           ui.close();
@@ -711,10 +742,39 @@ impl App {
       ai,
       size,
       live_unseen: 0,
+      lock_seen: None,
       agents,
     };
     app.refresh();
     Ok(app)
+  }
+
+  // (locked, locked by mig), refreshed every couple of seconds.
+  fn lock_state(&mut self) -> (bool, bool) {
+    if let Some((t, l, m)) = self.lock_seen
+      && t.elapsed() < Duration::from_secs(2)
+    {
+      return (l, m);
+    }
+    let s = crate::lock::state(&self.repo, "mig");
+    let v = (!s.files.is_empty(), s.by_mig);
+    self.lock_seen = Some((Instant::now(), v.0, v.1));
+    v
+  }
+
+  fn set_lock(&mut self, on: bool) {
+    let r = if on {
+      crate::lock::lock(&self.repo, "mig", false).map(|l| {
+        format!(
+          "Claude's shell is locked ({}). Start Claude Code again for it to take effect.",
+          l.file
+        )
+      })
+    } else {
+      crate::lock::unlock(&self.repo).map(|f| format!("Claude's shell is unlocked (removed what mig added to {f})."))
+    };
+    self.lock_seen = None;
+    self.status = r.map_err(|e| format!("{e:#}"));
   }
 
   fn reload_config(&mut self) {
