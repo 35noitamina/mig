@@ -11,7 +11,7 @@ use crate::ai::AiConfig;
 use crate::assist::ContextOpts;
 use crate::guard::{self, SaveBlocked};
 use crate::scan::{Finding, SecretsFound};
-use crate::{absorb, agent, ai, assist, gc, growth, oplog, ops, repo, rev, scan, setup, split, workspace};
+use crate::{absorb, agent, ai, assist, gc, growth, oplog, ops, repo, rev, runtool, scan, setup, split, workspace};
 
 const HELP: &str = "\
 {about}
@@ -61,6 +61,7 @@ For AI tools:
   context            Markdown overview of the repository, secrets redacted
   mcp                Run as an MCP server over stdio
   ws                 Folders the GUI window and the MCP server work in (ls, add, rm, rename)
+  run                Run a command or script through mig's safety check (exec, script, check, log)
 
 GUI:
   gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
@@ -162,6 +163,9 @@ enum Cmd {
   /// Folders open in the GUI window; AI tools (MCP) may work only in these
   #[command(subcommand)]
   Ws(WsCmd),
+  /// Run a command or script through the same safety check AI agents go through
+  #[command(subcommand)]
+  Run(RunCmd),
 
   // Earlier top-level spellings, kept working but out of the help.
   #[command(hide = true)]
@@ -184,6 +188,40 @@ enum Cmd {
   Gc,
   #[command(hide = true)]
   Size(SizeArgs),
+}
+
+#[derive(Subcommand)]
+enum RunCmd {
+  /// Run a program: mig run exec -- cargo test
+  Exec {
+    #[arg(long)]
+    cwd: Option<String>,
+    /// Seconds before it is stopped
+    #[arg(long)]
+    timeout: Option<u64>,
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<String>,
+  },
+  /// Run a script from a file (or from standard input when no file is given)
+  Script {
+    /// sh, bash, python, node, powershell, cmd, ruby or perl
+    lang: String,
+    file: Option<PathBuf>,
+    #[arg(long)]
+    cwd: Option<String>,
+    #[arg(long)]
+    timeout: Option<u64>,
+  },
+  /// Say what the check thinks of a program, without running it
+  Check {
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    argv: Vec<String>,
+  },
+  /// Show recent runs
+  Log {
+    #[arg(short = 'n', default_value_t = 20)]
+    count: usize,
+  },
 }
 
 #[derive(Subcommand)]
@@ -551,6 +589,7 @@ enum Action {
   Size(SizeOpts),
   Agent(AgentCmd),
   Context(ContextOpts),
+  Run(RunCmd),
 }
 
 enum Top {
@@ -573,6 +612,7 @@ impl Cmd {
       Cmd::Mcp => return Ok(Top::Mcp),
       Cmd::Ws(w) => return Ok(Top::Ws(w)),
       Cmd::Agent(a) => A::Agent(a),
+      Cmd::Run(r) => A::Run(r),
       Cmd::Context { diff, files, count } => A::Context(ContextOpts {
         diff,
         files,
@@ -971,6 +1011,7 @@ fn dispatch(repo: &Repository, action: Action) -> Result<()> {
       Ok(())
     }
     Action::Agent(cmd) => run_agent(repo, cmd),
+    Action::Run(cmd) => run_run(repo, cmd),
     Action::Context(opts) => {
       let (text, redacted) = assist::context(repo, &opts)?;
       print!("{text}");
@@ -1592,6 +1633,84 @@ fn run_ws(dir: &std::path::Path, cmd: WsCmd) -> Result<()> {
     WsCmd::Rename { name, new } => {
       workspace::rename(&name, &new)?;
       println!("renamed {name} to {new}");
+    }
+  }
+  Ok(())
+}
+
+fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
+  match cmd {
+    RunCmd::Exec { cwd, timeout, argv } => {
+      let done = runtool::run(
+        repo,
+        None,
+        runtool::Request {
+          kind: runtool::Kind::Argv(argv),
+          cwd,
+          timeout,
+        },
+      )?;
+      println!("{}", done.text);
+    }
+    RunCmd::Script {
+      lang,
+      file,
+      cwd,
+      timeout,
+    } => {
+      use std::io::Read;
+      let mut code = String::new();
+      match file {
+        Some(f) => code = std::fs::read_to_string(&f).map_err(|e| anyhow!("{}: {e}", f.display()))?,
+        None => {
+          std::io::stdin().read_to_string(&mut code)?;
+        }
+      }
+      let l = crate::runcheck::Lang::parse(&lang).ok_or_else(|| anyhow!("unknown lang {lang}"))?;
+      let done = runtool::run(
+        repo,
+        None,
+        runtool::Request {
+          kind: runtool::Kind::Script {
+            lang: l,
+            name: lang,
+            code,
+            args: Vec::new(),
+          },
+          cwd,
+          timeout,
+        },
+      )?;
+      println!("{}", done.text);
+    }
+    RunCmd::Check { argv } => {
+      let text = runtool::check_only(
+        repo,
+        &runtool::Request {
+          kind: runtool::Kind::Argv(argv),
+          cwd: None,
+          timeout: None,
+        },
+      )?;
+      println!("{text}");
+    }
+    RunCmd::Log { count } => {
+      for e in runtool::recent(repo.path(), count) {
+        let when = fmt_time(e.ts / 1000);
+        let result = match (e.verdict.as_str(), e.exit, e.timed_out) {
+          (_, _, true) => paint("33", "timed out"),
+          ("ran", Some(0), _) => paint("32", "ok"),
+          ("ran", Some(c), _) => paint("31", &format!("exit {c}")),
+          (v, _, _) => paint("31", v),
+        };
+        println!(
+          "{}  {:<10} {:<14} {}",
+          paint("2", &when),
+          e.agent.as_deref().unwrap_or("(you)"),
+          result,
+          e.summary
+        );
+      }
     }
   }
   Ok(())

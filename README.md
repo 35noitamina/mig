@@ -150,6 +150,17 @@ mig repo size --json --by week                # 数値を JSON で出力
 
 セッションが複数あるときは、`--name NAME` でどれかを選びます（`start` と `status` 以外）。
 
+#### コマンドの安全な実行 — `mig run`
+
+AI エージェントが MCP の `run` / `run_script` で通る検査と同じものを通して、コマンドやスクリプトを実行します。
+
+| コマンド | 内容 |
+|---|---|
+| `mig run exec [--cwd D] [--timeout S] -- CMD ARGS…` | プログラムを実行（シェルは通しません） |
+| `mig run script LANG [FILE]` | スクリプトを実行（FILE がなければ標準入力）。`LANG` は `sh` `bash` `python` `node` `powershell` `cmd` `ruby` `perl` |
+| `mig run check -- CMD ARGS…` | 実行せずに、検査の結果だけ見る |
+| `mig run log [-n N]` | 最近の実行の一覧（エージェント名、結果、コマンド） |
+
 #### AI ツール向け
 
 | コマンド | 内容 |
@@ -372,6 +383,35 @@ allow = ["AKIAIOSFODNN7EXAMPLE"]
 
 ---
 
+### コマンドの実行の方針（`[run]`）
+
+AI エージェントは、Claude Code の Bash の代わりに、MCP の `run`（プログラムと引数のリスト）と `run_script`（一時的なスクリプト）でコマンドを実行します。実行の前に、mig が検査します。
+
+- **拒否**（実行しません）: ホームやルートや `..` の再帰削除、ダウンロードしてそのまま実行（`curl … | sh`）、隠した文字列のデコード実行、`sudo` などの管理者権限、`git push`、認証情報のファイル（`~/.ssh`、`~/.aws`、`.env` など）、システムのフォルダへの書き込み、`crontab` やレジストリなどでの常駐、外部への送信（`curl -T`、`nc -e`、`scp` など）、`mig` と Claude Code の設定（`.claude/`、`.mcp.json`、`.mig.toml`）への触れ方、任意の URL からのパッケージ導入、スクリプトの中のシークレット
+- **警告**（初期値の `auto` では、そのまま実行して、結果に添えます）: ネットワークへの接続、`git reset --hard` など作業を捨てる操作、大量の削除
+- **メモ**: 環境変数の一覧表示、実行時にコードを組み立てる書き方など
+
+実行するときは、`*_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `ANTHROPIC_*` / `OPENAI_*` / `GITHUB_TOKEN` などの名前の環境変数を取り除きます。標準入力は空で、時間（初期値 120 秒、最大 600 秒）を超えると、プロセスごと止めます。出力は 60KB までで（先頭と末尾を残します）、シークレットは `[REDACTED]` に置き換えます。スクリプトは `.git/mig/run/` の一時ファイルに書いて、実行したら消します。
+
+エージェントのセッションがあるときは、コマンドが変えたファイルも、そのエージェントが書いたものとして記録します（`agent_finish` や `agent_abort` の対象になります）。
+
+検査は、うっかりと、明らかに危ない操作を止めるためのものです。書き方しだいですり抜けられるので、悪意のあるコードを閉じ込める仕組み（サンドボックス）ではありません。
+
+```toml
+[run]
+mode = "auto"                 # auto: 拒否以外は実行 / ask: 警告は人間の承認待ち / strict: 定番のコマンド以外は承認待ち
+timeout_secs = 120
+max_timeout_secs = 600
+output_limit_kb = 60
+allow = ["curl https://api.example.com/*"]   # この形のコマンドは、警告を出さずに実行
+deny = ["terraform apply*"]                  # この形のコマンドは拒否
+allow_rules = ["remote-package"]             # このルールの拒否を警告に下げる
+env_drop = ["MY_*"]                          # 追加で取り除く環境変数
+env_keep = ["GITHUB_TOKEN"]                  # 取り除かない環境変数
+```
+
+`.mig.toml` と `.claude/` と `.mcp.json` は、エージェントのファイル操作（`write` / `edit` / `move` / `delete`）では書き換えられません。人間だけが変えられます。
+
 ### 仕組み
 
 #### undo
@@ -510,6 +550,9 @@ mig diff    通常の unified diff
 | `agent_start` | `name` | セッションの開始メッセージ。他のエージェントがいれば、その名前 |
 | `checkpoint` | `message`、`name` | `checkpoint <ハッシュ>`、または変更が無い旨 |
 | `agent_finish` | **`message`**、`name` | 終了メッセージと新しい HEAD。コミットしなかった他の人の変更があれば、その数 |
+| `run` | **`argv`**（プログラムと引数のリスト）、`cwd`、`timeout` | `exit 0 in 3.2s` と出力（先頭と末尾、シークレットは伏せ字）、警告、変わったファイル、チェックポイント。拒否されたときは `isError` で理由 |
+| `run_script` | **`lang`**、**`code`**、`args`、`cwd`、`timeout` | `run` と同じ。コードは一時ファイルに書いて実行し、消します |
+| `run_check` | `argv`、または `lang` と `code` | 実行せずに、実行される / 承認待ち / 拒否の判定と、見つかった理由 |
 | `agent_abort` | `name` | 終了メッセージ、元に戻したファイルの数、捨てた作業の保存先。他の人があとから変えたため戻さなかったファイルがあれば、その一覧 |
 | `ls` | `path`（既定 `.`）、`depth`（1〜6、既定 1） | `.gitignore` を除いた一覧。ファイルはサイズと変更記号（`M` / `A` / `?`）つき |
 | `read` | **`path`**、`from`、`to` | 見出し1行（行数・サイズ・範囲）と、行番号つきの本文。既定は 400 行まで（上限 2000）。続きがあれば `from=` の案内が付く。バイナリと 8MB 超は本文なし。シークレットは `[REDACTED]` |
@@ -530,6 +573,8 @@ mig diff    通常の unified diff
 |---|---|
 | `.git/mig/oplog.json` | undo / redo 用の操作ログ（最大 500 件） |
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
+| `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
+| `.git/mig/run/` | 実行中の一時スクリプト（終わると消えます） |
 | `.git/mig/live.jsonl` | MCP のファイル操作（`edit` / `write` / `move` / `delete`）の短いログ。GUI の Live タブが「どのツールで書き込まれたか」を表示するために、直近の数秒分だけ読みます |
 | `.git/mig/growth.json` | サイズの推移の計算結果（次回は増えたコミット分だけ計算します） |
 | `refs/mig/agents/<名前>/start` / `base` / `cp` / `files` | セッション開始時の HEAD、開始時の作業ツリーのスナップショット、最新のチェックポイント、書いたファイルの前後の内容です。チェックポイントは `cp` から親をたどって得られます。以前の `refs/mig/agent/*` と `agent.json` は、最初に読んだときに自動で移します |
@@ -573,7 +618,7 @@ cargo fmt && cargo clippy
 | `setup.rs` / `github.rs` | リポジトリの作成・リモート・GitHub への作成 |
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
-| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧 |
+| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。

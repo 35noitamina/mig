@@ -12,6 +12,55 @@ pub struct Config {
   pub scan: ScanSection,
   pub save: SaveSection,
   pub editor: EditorSection,
+  pub run: RunSection,
+}
+
+// How mig treats commands and scripts that an AI agent asks it to run.
+#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RunMode {
+  // Run everything except what the check blocks.
+  #[default]
+  Auto,
+  // Also ask a person before running anything the check warns about.
+  Ask,
+  // Ask before anything that is not a routine command.
+  Strict,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct RunSection {
+  pub mode: RunMode,
+  pub timeout_secs: u64,
+  pub max_timeout_secs: u64,
+  pub output_limit_kb: usize,
+  pub approval_wait_secs: u64,
+  // Command patterns (`*` matches anything) that are always fine / never allowed.
+  pub allow: Vec<String>,
+  pub deny: Vec<String>,
+  // Rule ids whose "block" is lowered to a warning, for example "remote-package".
+  pub allow_rules: Vec<String>,
+  // Environment variables to remove (name patterns), and ones to keep although they look secret.
+  pub env_drop: Vec<String>,
+  pub env_keep: Vec<String>,
+}
+
+impl Default for RunSection {
+  fn default() -> Self {
+    RunSection {
+      mode: RunMode::Auto,
+      timeout_secs: 120,
+      max_timeout_secs: 600,
+      output_limit_kb: 60,
+      approval_wait_secs: 120,
+      allow: Vec::new(),
+      deny: Vec::new(),
+      allow_rules: Vec::new(),
+      env_drop: Vec::new(),
+      env_keep: Vec::new(),
+    }
+  }
 }
 
 #[derive(Deserialize, Default)]

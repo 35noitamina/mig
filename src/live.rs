@@ -74,8 +74,9 @@ pub fn recent(git_dir: &Path, path: &str, within_ms: i64) -> Option<Entry> {
     .find(|e| now - e.ts <= within_ms && covers(e, path))
 }
 
+// An entry for "." (a command run in the folder) covers every path.
 fn covers(e: &Entry, path: &str) -> bool {
-  e.path == path || path.starts_with(&format!("{}/", e.path))
+  e.path == "." || e.path == path || path.starts_with(&format!("{}/", e.path))
 }
 
 // The newest entry for `path` written by someone other than `me`.

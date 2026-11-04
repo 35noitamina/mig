@@ -2346,6 +2346,7 @@ dependencies = [
  "globset",
  "ignore",
  "image",
+ "libc",
  "notify",
  "notify-rust",
  "regex",

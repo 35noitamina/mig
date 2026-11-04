@@ -32,6 +32,9 @@ mod ops;
 mod patch;
 mod repo;
 mod rev;
+mod runcheck;
+mod runner;
+mod runtool;
 mod scan;
 #[cfg(feature = "gui")]
 mod settings;

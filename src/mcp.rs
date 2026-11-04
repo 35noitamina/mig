@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::assist::{self, ContextOpts};
 use crate::guard::SaveBlocked;
-use crate::{agent, ai, files, oplog, ops, repo, rev, scan, workspace};
+use crate::{agent, ai, files, oplog, ops, repo, rev, runtool, scan, workspace};
 
 const MAX_DIFF: usize = 100_000;
 
@@ -109,6 +109,38 @@ fn tools() -> Vec<Value> {
       "Delete a file, or a folder with recursive=true.",
       json!({"path": {"type": "string"}, "recursive": {"type": "boolean"}}),
       &["path"],
+    ),
+    tool(
+      "run",
+      "Run a program after mig checks it (no shell: give the program and its arguments as a list). Dangerous things are refused: wiping folders, pushing, piping downloads into a shell, reading credential files, editing mig or Claude Code settings. Secret-looking environment variables are not passed on. Output is cut to a readable size with secrets masked. Use this instead of a shell tool.",
+      json!({
+        "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments, e.g. [\"cargo\", \"test\"]"},
+        "cwd": {"type": "string", "description": "Folder inside the repository (default: the repository root)"},
+        "timeout": {"type": "integer", "minimum": 1, "description": "Seconds before it is stopped (default 120, at most 600)"}
+      }),
+      &["argv"],
+    ),
+    tool(
+      "run_script",
+      "Run a temporary script after mig checks it: for pipes, loops or several commands. The code is written to a temporary file, run, and removed. The same checks and limits as run apply.",
+      json!({
+        "lang": {"type": "string", "description": "sh, bash, python, node, powershell, cmd, ruby or perl"},
+        "code": {"type": "string", "description": "The script"},
+        "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments for the script"},
+        "cwd": {"type": "string"},
+        "timeout": {"type": "integer", "minimum": 1}
+      }),
+      &["lang", "code"],
+    ),
+    tool(
+      "run_check",
+      "Check a command or script without running it. Takes the same arguments as run (argv) or run_script (lang and code) and says whether it would run, and what looks suspicious.",
+      json!({
+        "argv": {"type": "array", "items": {"type": "string"}},
+        "lang": {"type": "string"},
+        "code": {"type": "string"}
+      }),
+      &[],
     ),
     tool(
       "status",
@@ -260,6 +292,15 @@ fn run_tool(repo: &Repository, name: &str, args: &Value, rc: &mut RepoConn) -> R
         ));
       }
       Ok(out)
+    }
+    "run" | "run_script" => {
+      let agent = current_agent(repo, rc);
+      let req = runtool::parse(args, name == "run_script")?;
+      Ok(runtool::run(repo, agent.as_ref(), req)?.text)
+    }
+    "run_check" => {
+      let script = args.get("code").is_some();
+      runtool::check_only(repo, &runtool::parse(args, script)?)
     }
     "ls" => files::ls(repo, args),
     "search" => files::search(repo, args),
@@ -520,7 +561,7 @@ impl Server {
   }
 }
 
-const INSTRUCTIONS: &str = "Version control and file tools. Several folders may be open: call `repos` to see them and pass `repo` to choose one (the default is the folder the server started in). Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.";
+const INSTRUCTIONS: &str = "Version control, file and run tools. To run a command use run (a program and its arguments as a list) or run_script (a temporary script); both are checked first and dangerous ones are refused. Do not look for another way to run commands. Several folders may be open: call `repos` to see them and pass `repo` to choose one (the default is the folder the server started in). Call agent_start before changing files: then every write, edit, move and delete is checkpointed and the whole session can be undone with agent_abort or squashed with agent_finish. Prefer search and read with from/to over reading whole files, and edit over write.";
 
 pub fn serve(dir: &Path) -> Result<()> {
   let mut server = Server {

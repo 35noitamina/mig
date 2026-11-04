@@ -91,6 +91,17 @@ fn rel(root: &Path, p: &Path) -> String {
     .join("/")
 }
 
+// Settings that decide what an agent may do can only be changed by a person.
+fn refuse_protected(name: &str) -> Result<()> {
+  let lower = name.to_lowercase();
+  let guarded =
+    lower.split('/').any(|c| c == ".claude") || lower == ".mcp.json" || lower == ".mig.toml" || lower == ".claude.json";
+  if guarded {
+    bail!("{name} holds settings that decide what an agent may do, so only a person can change it");
+  }
+  Ok(())
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
   bytes[..bytes.len().min(8000)].contains(&0)
 }
@@ -563,6 +574,7 @@ pub fn edit(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let input = required(args, "path")?;
   let path = resolve(&root, &input)?;
   let name = rel(&root, &path);
+  refuse_protected(&name)?;
   let bytes = std::fs::read(&path).map_err(|_| anyhow!("{input}: no such file"))?;
   guard_fresh(repo, ctx, &name, Some(&bytes))?;
   let original = String::from_utf8(bytes).map_err(|_| anyhow!("{input} is not UTF-8 text"))?;
@@ -607,6 +619,7 @@ pub fn write(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
     bail!("{input} is a folder");
   }
   let name = rel(&root, &path);
+  refuse_protected(&name)?;
   let previous = std::fs::read(&path).ok();
   guard_fresh(repo, ctx, &name, previous.as_deref())?;
   refuse_secrets(repo, &name, &content)?;
@@ -644,6 +657,8 @@ pub fn move_path(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<Strin
     bail!("{to} already exists");
   }
   let (src_name, dst_name) = (rel(&root, &src), rel(&root, &dst));
+  refuse_protected(&src_name)?;
+  refuse_protected(&dst_name)?;
   let moved: Vec<(String, Vec<u8>)> = if src.is_dir() {
     files_under(&root, &src)
   } else {
@@ -676,6 +691,7 @@ pub fn delete(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> 
     bail!("refusing to delete the repository root");
   }
   let name = rel(&root, &path);
+  refuse_protected(&name)?;
   let gone: Vec<(String, Vec<u8>)> = if path.is_dir() {
     let entries = std::fs::read_dir(&path)?.count();
     if entries > 0 && !flag(args, "recursive") {
@@ -726,6 +742,23 @@ mod tests {
     assert!(resolve(&root, "a/../../x").is_err());
     assert!(resolve(&root, ".git/config").is_err());
     assert!(resolve(&root, "/etc/passwd").is_err());
+  }
+
+  #[test]
+  fn settings_files_are_protected() {
+    for n in [
+      ".claude/settings.local.json",
+      ".mig.toml",
+      ".mcp.json",
+      "sub/.claude/x",
+      ".CLAUDE/a",
+      ".claude.json",
+    ] {
+      assert!(refuse_protected(n).is_err(), "{n}");
+    }
+    for n in ["src/main.rs", "claude.md", ".claudeignore", "docs/.mig.toml.example"] {
+      assert!(refuse_protected(n).is_ok(), "{n}");
+    }
   }
 
   #[test]
