@@ -15,9 +15,10 @@ use serde_json::Value;
 
 use crate::approval::{self, Answer, Pending};
 use crate::config::{self, RunSection};
+use crate::outfmt::{self, Filter};
 use crate::runcheck::{self, Lang, Level, Report, Spec, Verdict};
 use crate::runner::{self, Params, TempScript};
-use crate::{agent, live, repo};
+use crate::{agent, live, outlog, repo};
 
 const MAX_TRACKED: u64 = 2 << 20;
 const LOG_KEEP: usize = 500;
@@ -38,7 +39,13 @@ pub struct Request {
   pub kind: Kind,
   pub cwd: Option<String>,
   pub timeout: Option<u64>,
+  pub filter: Filter,
+  // Wait this long for the end; if it has not come, hand back what there is and keep running.
+  pub wait_secs: Option<u64>,
 }
+
+// Called with the lines a run has just printed (clean and masked).
+pub type LineSink = Arc<dyn Fn(Vec<String>) + Send + Sync>;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LogEntry {
@@ -52,6 +59,9 @@ pub struct LogEntry {
   pub timed_out: bool,
   pub secs: f64,
   pub tail: String,
+  // The id of the stored output (see outlog).
+  #[serde(default)]
+  pub out: String,
   // The mig process that ran it, so a server can tell its own runs from other people's.
   #[serde(default)]
   pub pid: u32,
@@ -142,6 +152,8 @@ pub fn parse(args: &Value, script: bool) -> Result<Request> {
     kind,
     cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
     timeout: args.get("timeout").and_then(Value::as_u64),
+    filter: Filter::from_args(args)?,
+    wait_secs: args.get("wait_secs").and_then(Value::as_u64),
   })
 }
 
@@ -237,6 +249,14 @@ fn record_changes(repo: &Repository, root: &Path, agent_id: &str, before: &HashM
   changed
 }
 
+// Some notes are worth saying once, not after every run.
+static NOTE_ENV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NOTE_NO_AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
+  !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct Done {
   pub text: String,
 }
@@ -270,6 +290,8 @@ pub struct Prepared {
   dropped: Vec<String>,
   timeout: Duration,
   limit: usize,
+  filter: Filter,
+  id: String,
   agent: Option<agent::Session>,
   _script: Option<TempScript>,
 }
@@ -277,6 +299,11 @@ pub struct Prepared {
 impl Prepared {
   pub fn summary(&self) -> &str {
     &self.entry.summary
+  }
+
+  // The id the output is stored under; known before the program starts.
+  pub fn id(&self) -> &str {
+    &self.id
   }
 }
 
@@ -313,6 +340,7 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
     timed_out: false,
     secs: 0.0,
     tail: String::new(),
+    out: String::new(),
     pid: std::process::id(),
   };
   match verdict {
@@ -396,13 +424,15 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
     dropped,
     timeout,
     limit: cfg.output_limit_kb.max(1) * 1024,
+    filter: req.filter.clone(),
+    id: approval::new_id(),
     agent: agent.cloned(),
     _script,
   })
 }
 
 impl Prepared {
-  pub fn go(self, repo: &Repository, sink: Option<runner::Sink>, cancel: Option<Arc<AtomicBool>>) -> Result<Done> {
+  pub fn go(self, repo: &Repository, lines: Option<LineSink>, cancel: Option<Arc<AtomicBool>>) -> Result<Done> {
     let Prepared {
       mut entry,
       report,
@@ -414,6 +444,8 @@ impl Prepared {
       dropped,
       timeout,
       limit,
+      filter,
+      id,
       agent,
       _script,
     } = self;
@@ -421,7 +453,33 @@ impl Prepared {
     let before = agent.map(|_| snapshot_dirty(repo, &root));
     let who = agent.map(|a| a.name.clone());
     live::record(repo, "mig run", ".", who.as_deref());
-    let outcome = runner::execute(
+    entry.out = id.clone();
+    let writer = Arc::new(outlog::create(repo.path(), &id, who.as_deref(), &entry.summary)?);
+    let (w2, ls2) = (writer.clone(), lines.clone());
+    let sink: runner::Sink = Arc::new(move |bytes: &[u8]| {
+      let got = w2.feed(bytes);
+      if !got.is_empty()
+        && let Some(f) = &ls2
+      {
+        f(got);
+      }
+    });
+    // A person can ask for a stop from the GUI; that arrives as a file next to the output.
+    let cancel = cancel.unwrap_or_default();
+    let over = Arc::new(AtomicBool::new(false));
+    {
+      let (git, id, cancel, over) = (repo.path().to_path_buf(), id.clone(), cancel.clone(), over.clone());
+      std::thread::spawn(move || {
+        while !over.load(std::sync::atomic::Ordering::Relaxed) {
+          if outlog::stop_requested(&git, &id) {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            return;
+          }
+          std::thread::sleep(Duration::from_millis(300));
+        }
+      });
+    }
+    let result = runner::execute(
       Params {
         program,
         args,
@@ -429,11 +487,27 @@ impl Prepared {
         timeout,
         env,
         limit,
-        sink,
-        cancel: cancel.clone(),
+        sink: Some(sink),
+        cancel: Some(cancel.clone()),
       },
       || live::record(repo, "mig run", ".", who.as_deref()),
-    )?;
+    );
+    over.store(true, std::sync::atomic::Ordering::Relaxed);
+    let outcome = match result {
+      Ok(o) => o,
+      Err(e) => {
+        writer.finish(None, false, false, 0.0);
+        return Err(e);
+      }
+    };
+    let rest = writer.finish(outcome.exit, outcome.timed_out, outcome.cancelled, outcome.secs);
+    if !rest.is_empty()
+      && let Some(f) = &lines
+    {
+      f(rest);
+    }
+    let stored = outlog::lines(repo.path(), &id).unwrap_or_default();
+    let ok = outcome.exit == Some(0) && !outcome.timed_out && !outcome.cancelled;
 
     let mut changed = Vec::new();
     let mut note = String::new();
@@ -452,7 +526,7 @@ impl Prepared {
     entry.exit = outcome.exit;
     entry.timed_out = outcome.timed_out;
     entry.secs = outcome.secs;
-    entry.tail = tail_of(&outcome.output);
+    entry.tail = tail_of(&stored[stored.len().saturating_sub(40)..].join("\n"));
     append_log(repo.path(), &entry);
 
     let head = if outcome.cancelled {
@@ -466,12 +540,15 @@ impl Prepared {
       }
     };
     let mut text = format!("{head}\n");
-    if outcome.output.trim().is_empty() {
+    let shown = outfmt::render(&stored, &filter, ok, limit);
+    if stored.is_empty() {
       text.push_str("(no output)\n");
+    } else if shown.text.is_empty() {
+      text.push_str(&format!("({} lines not shown; run_output job={id})\n", shown.total));
     } else {
-      text.push_str(&outcome.output);
-      if !outcome.output.ends_with('\n') {
-        text.push('\n');
+      text.push_str(&shown.text);
+      if shown.shown < shown.total {
+        text.push_str(&format!("(all {} lines: run_output job={id})\n", shown.total));
       }
     }
     let notes: Vec<String> = report
@@ -483,7 +560,7 @@ impl Prepared {
     if !notes.is_empty() {
       text.push_str(&format!("notes:\n{}\n", notes.join("\n")));
     }
-    if !dropped.is_empty() {
+    if !dropped.is_empty() && first_time(&NOTE_ENV) {
       text.push_str(&format!(
         "({} environment variable(s) that look like credentials were not passed on)\n",
         dropped.len()
@@ -501,7 +578,7 @@ impl Prepared {
         }
       ));
     }
-    if !note.is_empty() {
+    if !note.is_empty() && (agent.is_some() || first_time(&NOTE_NO_AGENT)) {
       text.push_str(&note);
       text.push('\n');
     }

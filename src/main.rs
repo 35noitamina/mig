@@ -35,6 +35,8 @@ mod lock;
 mod mcp;
 mod oplog;
 mod ops;
+mod outfmt;
+mod outlog;
 mod patch;
 mod repo;
 mod rev;

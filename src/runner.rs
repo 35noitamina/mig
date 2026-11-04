@@ -301,6 +301,7 @@ pub struct Outcome {
   pub timed_out: bool,
   pub cancelled: bool,
   pub secs: f64,
+  #[cfg_attr(not(test), allow(dead_code))]
   pub output: String,
 }
 

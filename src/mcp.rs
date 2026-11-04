@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use crate::assist::{self, ContextOpts};
 use crate::events::{self, Hub, Sub};
 use crate::guard::SaveBlocked;
+use crate::outfmt::Filter;
 use crate::{agent, ai, files, inbox, jobs, oplog, ops, repo, rev, runtool, scan, workspace};
 
 const MAX_DIFF: usize = 100_000;
@@ -120,16 +121,31 @@ fn tools() -> Vec<Value> {
         "argv": {"type": "array", "items": {"type": "string"}, "description": "Program and arguments, e.g. [\"cargo\", \"test\"]"},
         "cwd": {"type": "string", "description": "Folder inside the repository (default: the repository root)"},
         "background": {"type": "boolean", "description": "Return at once with a job id; output arrives as events and run_output reads it. Use it for servers, watchers and long builds instead of waiting."},
+        "grep": {"type": "string", "description": "Regular expression: return only matching lines (numbered)"},
+        "invert": {"type": "boolean", "description": "With grep: return the lines that do not match"},
+        "grep_context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Lines around each match"},
+        "head": {"type": "integer", "minimum": 1, "description": "Only the first N lines"},
+        "tail": {"type": "integer", "minimum": 1, "description": "Only the last N lines"},
+        "quiet": {"type": "boolean", "description": "On success return only the line count; the output is kept for run_output"},
+        "preset": {"type": "string", "enum": ["errors"], "description": "errors: only error, warning and failure lines with a little context"},
+        "wait_secs": {"type": "integer", "minimum": 1, "description": "Wait this long; if it has not ended, return what it printed so far and let it go on as a job"},
         "timeout": {"type": "integer", "minimum": 1, "description": "Seconds before it is stopped (default 120, at most 600)"}
       }),
       &["argv"],
     ),
     tool(
       "run_output",
-      "Read what a background job printed (since = the number the last read ended with), or list the jobs when job is left out.",
+      "Read the stored output of a run, also while it still runs (job = the id from run; leave it out to list recent runs). since = the line number the last read ended with; from/to = a range of lines. The same filters as run (grep, head, tail) apply.",
       json!({
         "job": {"type": "string"},
-        "since": {"type": "integer", "minimum": 0}
+        "since": {"type": "integer", "minimum": 0},
+        "from": {"type": "integer", "minimum": 1},
+        "to": {"type": "integer", "minimum": 1},
+        "grep": {"type": "string", "description": "Regular expression: return only matching lines (numbered)"},
+        "invert": {"type": "boolean", "description": "With grep: return the lines that do not match"},
+        "grep_context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Lines around each match"},
+        "head": {"type": "integer", "minimum": 1, "description": "Only the first N lines"},
+        "tail": {"type": "integer", "minimum": 1, "description": "Only the last N lines"}
       }),
       &[],
     ),
@@ -148,6 +164,14 @@ fn tools() -> Vec<Value> {
         "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments for the script"},
         "cwd": {"type": "string"},
         "background": {"type": "boolean", "description": "Return at once with a job id (see run)"},
+        "grep": {"type": "string", "description": "Regular expression: return only matching lines (numbered)"},
+        "invert": {"type": "boolean", "description": "With grep: return the lines that do not match"},
+        "grep_context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Lines around each match"},
+        "head": {"type": "integer", "minimum": 1, "description": "Only the first N lines"},
+        "tail": {"type": "integer", "minimum": 1, "description": "Only the last N lines"},
+        "quiet": {"type": "boolean", "description": "On success return only the line count; the output is kept for run_output"},
+        "preset": {"type": "string", "enum": ["errors"], "description": "errors: only error, warning and failure lines with a little context"},
+        "wait_secs": {"type": "integer", "minimum": 1, "description": "Wait this long; if it has not ended, return what it printed so far and let it go on as a job"},
         "timeout": {"type": "integer", "minimum": 1}
       }),
       &["lang", "code"],
@@ -711,16 +735,54 @@ impl Server {
       }
       "run" | "run_script" => {
         let req = runtool::parse(args, name == "run_script")?;
-        if args.get("background").and_then(Value::as_bool).unwrap_or(false) {
-          return jobs::start(repo, agent.as_ref(), req, self.hub.clone(), rname);
+        let background = args.get("background").and_then(Value::as_bool).unwrap_or(false);
+        if background || req.wait_secs.is_some() {
+          let wait = req.wait_secs;
+          let text = jobs::start(repo, agent.as_ref(), req, self.hub.clone(), rname)?;
+          let id = text
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("")
+            .trim_end_matches(':')
+            .to_string();
+          if let (false, Some(secs)) = (background, wait) {
+            return Ok(match jobs::wait(root, &id, secs) {
+              Some(done) => done,
+              None => format!(
+                "still running after {secs}s as job {id}; what it printed so far:\n{}\n(run_output job={id} reads more, run_stop stops it)",
+                jobs::output(
+                  &git,
+                  &id,
+                  &jobs::Slice {
+                    since: 0,
+                    from: None,
+                    to: None
+                  },
+                  &Filter::default(),
+                  8000
+                )?
+              ),
+            });
+          }
+          return Ok(text);
         }
         Ok(runtool::run(repo, agent.as_ref(), req)?.text)
       }
       "run_output" => match args.get("job").and_then(Value::as_str) {
-        Some(id) => jobs::output(root, id, secs("since").unwrap_or(0) as usize),
-        None => Ok(jobs::list(root)),
+        Some(id) => jobs::output(
+          &git,
+          id,
+          &jobs::Slice {
+            since: secs("since").unwrap_or(0) as usize,
+            from: secs("from").map(|n| n as usize),
+            to: secs("to").map(|n| n as usize),
+          },
+          &Filter::from_args(args)?,
+          60 * 1024,
+        ),
+        None => Ok(jobs::list(&git)),
       },
-      "run_stop" => jobs::stop(root, &text(args, "job").ok_or_else(|| anyhow!("job is required"))?),
+      "run_stop" => jobs::stop(&git, &text(args, "job").ok_or_else(|| anyhow!("job is required"))?),
       _ => {
         let mut rc = lock(&conn);
         run_tool(repo, name, args, &mut rc)

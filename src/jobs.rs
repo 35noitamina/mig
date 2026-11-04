@@ -1,8 +1,8 @@
-// Runs that go on in the background: `run` with background = true returns at once with a job id,
-// output arrives as events (and can be read again with run_output), and the end is reported too.
-use std::collections::{BTreeMap, HashMap, VecDeque};
+// Runs that go on while the agent does something else: `run` with background = true, or with a
+// wait_secs that runs out. The output is in a file (see outlog) that anyone can read at any time;
+// this module keeps the running threads, sends job events, and hands out the output.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -10,33 +10,19 @@ use anyhow::{Result, anyhow, bail};
 use git2::Repository;
 
 use crate::events::Hub;
-use crate::runner::Sink;
-use crate::{agent, repo, runtool, scan};
+use crate::outfmt::{self, Filter};
+use crate::runtool::LineSink;
+use crate::{agent, outlog, runtool};
 
-const KEEP_BYTES: usize = 256 * 1024;
 const BATCH_BYTES: usize = 4096;
 const BATCH_EVERY: Duration = Duration::from_millis(1000);
 const KEEP_JOBS: usize = 20;
 
-struct Buf {
-  data: VecDeque<u8>,
-  // Offset of data[0] in everything the job ever printed.
-  base: usize,
-  // A line that is not finished yet.
-  partial: Vec<u8>,
-  // Lines not yet sent as an event.
-  unsent: String,
-  last_sent: Instant,
-}
-
-pub struct Job {
+struct Job {
   id: String,
   root: PathBuf,
-  summary: String,
-  started: Instant,
-  buf: Mutex<Buf>,
-  cancel: Arc<AtomicBool>,
   end: Mutex<Option<String>>,
+  result: Mutex<Option<String>>,
 }
 
 fn table() -> &'static Mutex<HashMap<String, Arc<Job>>> {
@@ -46,40 +32,6 @@ fn table() -> &'static Mutex<HashMap<String, Arc<Job>>> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
   m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-impl Buf {
-  fn add_line(&mut self, line: &str) {
-    let clean = scan::redact(line).0;
-    self.data.extend(clean.bytes());
-    self.data.push_back(b'\n');
-    while self.data.len() > KEEP_BYTES {
-      self.data.pop_front();
-      self.base += 1;
-    }
-    self.unsent.push_str(&clean);
-    self.unsent.push('\n');
-  }
-
-  fn feed(&mut self, bytes: &[u8]) {
-    for &b in bytes {
-      if b == b'\n' || b == b'\r' {
-        if !self.partial.is_empty() || b == b'\n' {
-          let line = String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned();
-          self.add_line(&line);
-        }
-      } else {
-        self.partial.push(b);
-      }
-    }
-  }
-
-  fn finish(&mut self) {
-    if !self.partial.is_empty() {
-      let line = String::from_utf8_lossy(&std::mem::take(&mut self.partial)).into_owned();
-      self.add_line(&line);
-    }
-  }
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -94,10 +46,26 @@ fn clip(s: &str, n: usize) -> String {
 }
 
 fn send(hub: &Hub, job: &Job, name: &str, actor: &Option<String>, text: String, state: &str) {
-  let mut meta = BTreeMap::new();
-  meta.insert("job".to_string(), job.id.clone());
-  meta.insert("state".to_string(), state.to_string());
+  let meta = std::collections::BTreeMap::from([
+    ("job".to_string(), job.id.clone()),
+    ("state".to_string(), state.to_string()),
+  ]);
   hub.push(&job.root, name, "job", actor.clone(), None, text, meta, None);
+}
+
+// Output lines go to the agent as events, about once a second and at most 4 KB at a time.
+struct Batch {
+  unsent: Vec<String>,
+  last: Instant,
+}
+
+fn take(b: &mut Batch) -> Option<String> {
+  if b.unsent.is_empty() {
+    return None;
+  }
+  let folded = outfmt::fold_repeats(&std::mem::take(&mut b.unsent)).join("\n");
+  b.last = Instant::now();
+  Some(clip(&folded, BATCH_BYTES))
 }
 
 // Starts the program on a thread of its own and returns the job id. Checks and approval happen
@@ -114,33 +82,17 @@ pub fn start(
     .ok_or_else(|| anyhow!("this repository has no working folder"))?
     .to_path_buf();
   let prepared = runtool::prepare(repo, agent, req)?;
-  let id = crate::approval::new_id();
+  let id = prepared.id().to_string();
   let job = Arc::new(Job {
     id: id.clone(),
     root: root.clone(),
-    summary: clip(prepared.summary(), 160),
-    started: Instant::now(),
-    buf: Mutex::new(Buf {
-      data: VecDeque::new(),
-      base: 0,
-      partial: Vec::new(),
-      unsent: String::new(),
-      last_sent: Instant::now(),
-    }),
-    cancel: Arc::new(AtomicBool::new(false)),
     end: Mutex::new(None),
+    result: Mutex::new(None),
   });
   {
     let mut t = lock(table());
     if t.len() >= KEEP_JOBS {
-      let finished: Vec<String> = t
-        .iter()
-        .filter(|(_, j)| lock(&j.end).is_some())
-        .map(|(k, _)| k.clone())
-        .collect();
-      for k in finished {
-        t.remove(&k);
-      }
+      t.retain(|_, j| lock(&j.end).is_none());
     }
     if t.len() >= KEEP_JOBS {
       bail!("too many background jobs are running; stop one with run_stop");
@@ -148,166 +100,152 @@ pub fn start(
     t.insert(id.clone(), job.clone());
   }
   let actor = agent.map(|a| a.name.clone());
-  let (j2, hub2, name2, actor2) = (job.clone(), hub.clone(), name.clone(), actor.clone());
-  let sink: Sink = Arc::new(move |bytes: &[u8]| {
+  let batch = Arc::new(Mutex::new(Batch {
+    unsent: Vec::new(),
+    last: Instant::now(),
+  }));
+  let (j2, hub2, name2, actor2, b2) = (job.clone(), hub.clone(), name.clone(), actor.clone(), batch.clone());
+  let sink: LineSink = Arc::new(move |lines: Vec<String>| {
     let ready = {
-      let mut b = lock(&j2.buf);
-      b.feed(bytes);
-      if !b.unsent.is_empty() && (b.unsent.len() >= BATCH_BYTES || b.last_sent.elapsed() >= BATCH_EVERY) {
-        b.last_sent = Instant::now();
-        Some(clip(&std::mem::take(&mut b.unsent), BATCH_BYTES))
+      let mut b = lock(&b2);
+      b.unsent.extend(lines);
+      let size: usize = b.unsent.iter().map(String::len).sum();
+      if size >= BATCH_BYTES || b.last.elapsed() >= BATCH_EVERY {
+        take(&mut b)
       } else {
         None
       }
     };
     if let Some(t) = ready {
-      send(
-        &hub2,
-        &j2,
-        &name2,
-        &actor2,
-        format!("job {}:\n{}", j2.id, t.trim_end()),
-        "output",
-      );
+      send(&hub2, &j2, &name2, &actor2, format!("job {}:\n{}", j2.id, t), "output");
     }
   });
-  let cancel = job.cancel.clone();
   let git_root = root.clone();
+  let summary = prepared.summary().to_string();
+  let job_t = job.clone();
   std::thread::spawn(move || {
-    let result = match repo::open(&git_root) {
-      Ok(r) => prepared.go(&r, Some(sink), Some(cancel)).map(|d| d.text),
+    let job = job_t;
+    let result = match crate::repo::open(&git_root) {
+      Ok(r) => prepared.go(&r, Some(sink), None).map(|d| d.text),
       Err(e) => Err(e),
     };
-    let rest = {
-      let mut b = lock(&job.buf);
-      b.finish();
-      std::mem::take(&mut b.unsent)
-    };
-    if !rest.trim().is_empty() {
-      send(
-        &hub,
-        &job,
-        &name,
-        &actor,
-        format!("job {}:\n{}", job.id, clip(rest.trim_end(), BATCH_BYTES)),
-        "output",
-      );
+    let rest = take(&mut lock(&batch));
+    if let Some(t) = rest {
+      send(&hub, &job, &name, &actor, format!("job {}:\n{t}", job.id), "output");
     }
-    let text = match result {
-      Ok(t) => t.lines().next().unwrap_or("").to_string() + &tail_notes(&t),
-      Err(e) => format!("failed: {e:#}"),
+    let (headline, full) = match result {
+      Ok(t) => (
+        t.lines().next().unwrap_or("").to_string()
+          + &t
+            .lines()
+            .find(|l| l.starts_with("changed:"))
+            .map(|l| format!("; {l}"))
+            .unwrap_or_default(),
+        t,
+      ),
+      Err(e) => (format!("failed: {e:#}"), format!("failed: {e:#}")),
     };
-    *lock(&job.end) = Some(text.clone());
+    *lock(&job.result) = Some(full);
+    *lock(&job.end) = Some(headline.clone());
     send(
       &hub,
       &job,
       &name,
       &actor,
-      format!("job {} finished: {text}", job.id),
+      format!("job {} finished: {headline}", job.id),
       "done",
     );
   });
-  Ok(format!(
-    "started job {id}: {}\nOutput arrives as events; run_output reads it, run_stop stops it.",
-    lock(table()).get(&id).map(|j| j.summary.clone()).unwrap_or_default()
-  ))
-}
-
-// The "changed: …" line is worth keeping in the end report.
-fn tail_notes(text: &str) -> String {
-  text
-    .lines()
-    .find(|l| l.starts_with("changed:"))
-    .map(|l| format!("; {l}"))
-    .unwrap_or_default()
-}
-
-fn find(root: &Path, id: &str) -> Result<Arc<Job>> {
-  lock(table())
-    .get(id)
-    .filter(|j| j.root == root)
-    .cloned()
-    .ok_or_else(|| anyhow!("no job {id} in this folder (jobs are forgotten when the server restarts)"))
-}
-
-pub fn output(root: &Path, id: &str, since: usize) -> Result<String> {
-  let job = find(root, id)?;
-  let b = lock(&job.buf);
-  let from = since.max(b.base);
-  let total = b.base + b.data.len();
-  let bytes: Vec<u8> = b.data.iter().skip(from - b.base).copied().collect();
-  let mut out = String::new();
-  if since < b.base {
-    out.push_str(&format!(
-      "… {} bytes were dropped (only the latest {} KB are kept) …\n",
-      b.base - since,
-      KEEP_BYTES / 1024
-    ));
-  }
-  out.push_str(&String::from_utf8_lossy(&bytes));
-  let state = match &*lock(&job.end) {
-    Some(e) => format!("finished: {e}"),
-    None => format!("running for {:.0}s", job.started.elapsed().as_secs_f64()),
-  };
-  Ok(format!(
-    "{}[{state}; next since={total}]",
-    if out.is_empty() || out.ends_with('\n') {
-      out
-    } else {
-      out + "\n"
+  // The output file is made by the thread; a reader that asks at once must find it.
+  let git = repo.path().to_path_buf();
+  for _ in 0..60 {
+    if outlog::meta(&git, &id).is_some() || lock(&job.end).is_some() {
+      break;
     }
+    std::thread::sleep(Duration::from_millis(50));
+  }
+  Ok(format!(
+    "started job {id}: {}\nOutput arrives as events; run_output reads it (with grep, head, tail), run_stop stops it.",
+    clip(&summary, 160)
   ))
 }
 
-pub fn stop(root: &Path, id: &str) -> Result<String> {
-  let job = find(root, id)?;
-  if lock(&job.end).is_some() {
-    return Ok("already finished".into());
+// Waits up to `secs` for the job to end. Some(result) when it did.
+pub fn wait(root: &Path, id: &str, secs: u64) -> Option<String> {
+  let job = lock(table()).get(id).filter(|j| j.root == root).cloned()?;
+  let until = Instant::now() + Duration::from_secs(secs);
+  loop {
+    if let Some(r) = lock(&job.result).clone() {
+      return Some(r);
+    }
+    if Instant::now() >= until {
+      return None;
+    }
+    std::thread::sleep(Duration::from_millis(100));
   }
-  job.cancel.store(true, Ordering::Relaxed);
+}
+
+pub struct Slice {
+  pub since: usize,
+  pub from: Option<usize>,
+  pub to: Option<usize>,
+}
+
+// What a run printed so far (or all of it), cut down by `filter`. Reads the file, so it works for
+// finished runs, runs of other processes and runs started by a person.
+pub fn output(git_dir: &Path, id: &str, slice: &Slice, filter: &Filter, limit: usize) -> Result<String> {
+  let all = outlog::lines(git_dir, id)?;
+  let m = outlog::meta(git_dir, id).ok_or_else(|| anyhow!("no run {id}"))?;
+  let total = all.len();
+  let (a, b) = match (slice.from, slice.to) {
+    (None, None) => (slice.since.min(total), total),
+    (f, t) => (
+      f.unwrap_or(1).saturating_sub(1).min(total),
+      t.unwrap_or(total).min(total),
+    ),
+  };
+  let part = &all[a..b.max(a)];
+  let ok = !m.running() && m.exit == Some(0);
+  let shown = outfmt::render_from(part, filter, ok, limit, a);
+  let state = if m.running() {
+    format!("running {:.0}s", (crate::live::now_ms() - m.ts) as f64 / 1000.0)
+  } else {
+    format!("{} in {:.1}s", m.headline(), m.secs)
+  };
+  let mut out = shown.text;
+  if !out.is_empty() && !out.ends_with('\n') {
+    out.push('\n');
+  }
+  Ok(format!(
+    "{out}[lines {}-{} of {total}; {state}; next since={b}]",
+    a + 1,
+    b.max(a)
+  ))
+}
+
+pub fn stop(git_dir: &Path, id: &str) -> Result<String> {
+  outlog::request_stop(git_dir, id)?;
   Ok("stopping; the end is reported as an event".into())
 }
 
-pub fn list(root: &Path) -> String {
-  let t = lock(table());
-  let mut rows: Vec<String> = t
-    .values()
-    .filter(|j| j.root == root)
-    .map(|j| {
-      let state = match &*lock(&j.end) {
-        Some(e) => format!("finished: {}", clip(e, 80)),
-        None => format!("running {:.0}s", j.started.elapsed().as_secs_f64()),
-      };
-      format!("{}  {state}  {}", j.id, j.summary)
+pub fn list(git_dir: &Path) -> String {
+  let rows: Vec<String> = outlog::list(git_dir)
+    .into_iter()
+    .take(15)
+    .map(|m| {
+      format!(
+        "{}  {}  {} lines  {}{}",
+        m.id,
+        m.headline(),
+        m.lines,
+        clip(&m.summary, 90),
+        m.agent.map(|a| format!("  [{a}]")).unwrap_or_default()
+      )
     })
     .collect();
-  rows.sort();
   if rows.is_empty() {
-    "no background jobs".into()
+    "no runs yet".into()
   } else {
     rows.join("\n")
-  }
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-
-  #[test]
-  fn lines_are_split_and_secrets_masked() {
-    let mut b = Buf {
-      data: VecDeque::new(),
-      base: 0,
-      partial: Vec::new(),
-      unsent: String::new(),
-      last_sent: Instant::now(),
-    };
-    b.feed(b"one\ntw");
-    b.feed(b"o\r\nghp_abcdefghijklmnopqrstuvwxyz0123456789\nlast");
-    b.finish();
-    let text = String::from_utf8_lossy(&b.data.iter().copied().collect::<Vec<_>>()).into_owned();
-    assert!(text.starts_with("one\ntwo\n"));
-    assert!(!text.contains("ghp_abc"));
-    assert!(text.ends_with("last\n"));
   }
 }

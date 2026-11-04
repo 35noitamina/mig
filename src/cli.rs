@@ -1696,6 +1696,8 @@ fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
         repo,
         None,
         runtool::Request {
+          filter: Default::default(),
+          wait_secs: None,
           kind: runtool::Kind::Argv(argv),
           cwd,
           timeout,
@@ -1722,6 +1724,8 @@ fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
         repo,
         None,
         runtool::Request {
+          filter: Default::default(),
+          wait_secs: None,
           kind: runtool::Kind::Script {
             lang: l,
             name: lang,
@@ -1738,6 +1742,8 @@ fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
       let text = runtool::check_only(
         repo,
         &runtool::Request {
+          filter: Default::default(),
+          wait_secs: None,
           kind: runtool::Kind::Argv(argv),
           cwd: None,
           timeout: None,
