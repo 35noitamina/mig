@@ -56,7 +56,12 @@ fn tools() -> Vec<Value> {
       json!({
         "path": {"type": "string"},
         "from": {"type": "integer", "minimum": 1, "description": "First line (default 1)"},
-        "to": {"type": "integer", "minimum": 1, "description": "Last line (default: 400 lines from `from`, at most 2000)"}
+        "to": {"type": "integer", "minimum": 1, "description": "Last line (default: 400 lines from `from`, at most 2000)"},
+        "outline": {"type": "boolean", "description": "Only the lines that start definitions (fn, class, headings...), with numbers"},
+        "grep": {"type": "string", "description": "Only the lines matching this regular expression, with numbers"},
+        "context": {"type": "integer", "minimum": 0, "maximum": 20, "description": "Lines around each grep match"},
+        "max_chars": {"type": "integer", "minimum": 500, "description": "Cap the reply size"},
+        "force": {"type": "boolean", "description": "Show the whole file even if you read it before (otherwise a second read shows only what changed)"}
       }),
       &["path"],
     ),
@@ -317,6 +322,7 @@ fn text(v: &Value, key: &str) -> Option<String> {
 struct RepoConn {
   agent: Option<String>,
   seen: HashMap<String, String>,
+  copies: HashMap<String, (String, String)>,
 }
 
 // The session this connection works as: the one it started, else one started by this process,
@@ -397,6 +403,7 @@ fn run_tool(repo: &Repository, name: &str, args: &Value, rc: &mut RepoConn) -> R
       let mut ctx = files::Ctx {
         agent,
         seen: &mut rc.seen,
+        copies: &mut rc.copies,
       };
       match name {
         "read" => files::read(repo, args, &mut ctx),

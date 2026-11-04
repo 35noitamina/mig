@@ -24,6 +24,8 @@ const LS_MAX: usize = 500;
 const LINE_CLIP: usize = 300;
 const READ_CLIP: usize = 2000;
 const MASK: &str = "[REDACTED]";
+const COPY_MAX: usize = 200 * 1024;
+const COPIES_MAX: usize = 60;
 
 fn text(v: &Value, key: &str) -> Option<String> {
   v.get(key).and_then(Value::as_str).map(str::to_string)
@@ -119,6 +121,9 @@ pub struct Ctx<'a> {
   pub agent: Option<agent::Session>,
   // Path -> hash of the content this client last read or wrote.
   pub seen: &'a mut HashMap<String, String>,
+  // Path -> (hash, text) of files this client has read completely, so a second read can show only
+  // what changed.
+  pub copies: &'a mut HashMap<String, (String, String)>,
 }
 
 impl Ctx<'_> {
@@ -159,6 +164,19 @@ fn after_write(
       Some(a) => ctx.seen.insert(name.clone(), agent::hash(a)),
       None => ctx.seen.remove(name),
     };
+    // The client knows what it wrote, so its copy moves along.
+    if ctx.copies.contains_key(name) {
+      match after
+        .as_deref()
+        .and_then(|a| std::str::from_utf8(a).ok())
+        .filter(|t| t.len() <= COPY_MAX)
+      {
+        Some(t) => ctx
+          .copies
+          .insert(name.clone(), (agent::hash(t.as_bytes()), t.to_string())),
+        None => ctx.copies.remove(name),
+      };
+    }
   }
   let Some(s) = &ctx.agent else {
     return "no agent session, so mig cannot undo this (agent_start first)".into();
@@ -239,6 +257,25 @@ pub fn ls(repo: &Repository, args: &Value) -> Result<String> {
   Ok(out)
 }
 
+#[derive(Default)]
+struct ReadOpts {
+  outline: bool,
+  grep: Option<regex::Regex>,
+  context: usize,
+  force: bool,
+}
+
+// Lines that start a definition: enough to see the shape of a file without reading it.
+fn outline_re(name: &str) -> regex::Regex {
+  let md = name.ends_with(".md") || name.ends_with(".markdown");
+  let pat = if md {
+    r"^#{1,6}\s"
+  } else {
+    r"^\s*(pub(\([^)]*\))?\s+)?(export\s+)?(default\s+)?(async\s+)?(unsafe\s+)?(abstract\s+)?(static\s+)?(fn|struct|enum|trait|impl|mod|macro_rules!|function|class|interface|namespace|def|func|type|object|protocol|extension|module|package)\b|^\s*(public|private|protected|internal)\s[^=;]*\(|^\s*(export\s+)?(const|let|var)\s+\w+\s*=\s*(async\s*)?(\([^)]*\)|\w+)\s*=>"
+  };
+  regex::Regex::new(pat).expect("fixed pattern")
+}
+
 fn read_one(
   root: &Path,
   input: &str,
@@ -246,6 +283,8 @@ fn read_one(
   to: Option<usize>,
   budget: usize,
   seen: &mut HashMap<String, String>,
+  copies: &mut HashMap<String, (String, String)>,
+  opts: &ReadOpts,
 ) -> Result<String> {
   let path = resolve(root, input)?;
   let meta = std::fs::metadata(&path).map_err(|_| anyhow!("{input}: no such file"))?;
@@ -270,6 +309,65 @@ fn read_one(
   let content = String::from_utf8_lossy(&bytes);
   let lines: Vec<&str> = content.lines().collect();
   let n = lines.len();
+  let whole = from.is_none() && to.is_none() && !opts.outline && opts.grep.is_none();
+  if whole && !opts.force {
+    if let Some((old_hash, old)) = copies.get(&name).cloned() {
+      let size = guard::fmt_size(meta.len());
+      if old_hash == agent::hash(&bytes) {
+        return Ok(format!(
+          "{name}  {n} lines  {size}  unchanged since you read it (force=true shows it again)\n"
+        ));
+      }
+      if let Ok((d, added, removed)) = diff(&old, &content, &name) {
+        let (d, _) = scan::redact(&d);
+        let d = d.find("@@").map_or(d.clone(), |i| d[i..].to_string());
+        if d.len() * 2 < content.len() {
+          copies.insert(name.clone(), (agent::hash(&bytes), content.to_string()));
+          return Ok(format!(
+            "{name}  {n} lines  {size}  changed since you read it (+{added} -{removed}); only the changes:\n{d}"
+          ));
+        }
+      }
+    }
+  }
+  if opts.outline || opts.grep.is_some() {
+    let re = opts.grep.clone().unwrap_or_else(|| outline_re(&name));
+    let mut hit = vec![false; n];
+    for (i, l) in lines.iter().enumerate() {
+      if re.is_match(l) {
+        for k in i.saturating_sub(opts.context)..=(i + opts.context).min(n.saturating_sub(1)) {
+          hit[k] = true;
+        }
+      }
+    }
+    let mut body = String::new();
+    let mut last: Option<usize> = None;
+    let mut masked = 0;
+    for (i, l) in lines.iter().enumerate().filter(|(i, _)| hit[*i]) {
+      if last.is_some_and(|p| i > p + 1) {
+        body.push_str("--\n");
+      }
+      let (safe, hits) = scan::redact(l);
+      masked += hits;
+      let row = format!("{:>5}  {}\n", i + 1, clip(&safe, READ_CLIP));
+      if body.len() + row.len() > budget {
+        body.push_str("… output limit reached\n");
+        break;
+      }
+      body.push_str(&row);
+      last = Some(i);
+    }
+    let what = if opts.outline { "outline" } else { "matches" };
+    let mut head = format!("{name}  {n} lines  {what}");
+    if masked > 0 {
+      head.push_str(&format!("  [{masked} secret(s) masked as {MASK}]"));
+    }
+    return Ok(if body.is_empty() {
+      format!("{head}: nothing found\n")
+    } else {
+      format!("{head}\n{body}")
+    });
+  }
   let from = from.unwrap_or(1).max(1);
   if n > 0 && from > n {
     bail!("{input}: the file has only {n} lines");
@@ -299,6 +397,12 @@ fn read_one(
   if masked > 0 {
     head.push_str(&format!("  [{masked} secret(s) masked as {MASK}]"));
   }
+  if whole && from == 1 && last == n && content.len() <= COPY_MAX {
+    if copies.len() >= COPIES_MAX {
+      copies.clear();
+    }
+    copies.insert(name.clone(), (agent::hash(&bytes), content.to_string()));
+  }
   let mut out = format!("{head}\n{body}");
   if last < n {
     out.push_str(&format!(
@@ -317,9 +421,23 @@ pub fn read(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
     &required(args, "path")?,
     number(args, "from"),
     number(args, "to"),
-    MAX_OUT,
+    number(args, "max_chars").map_or(MAX_OUT, |n| n.clamp(500, MAX_OUT)),
     ctx.seen,
+    ctx.copies,
+    &read_opts(args)?,
   )
+}
+
+fn read_opts(args: &Value) -> Result<ReadOpts> {
+  Ok(ReadOpts {
+    outline: args.get("outline").and_then(Value::as_bool).unwrap_or(false),
+    grep: match args.get("grep").and_then(Value::as_str) {
+      Some(g) => Some(regex::Regex::new(g).map_err(|e| anyhow!("grep is not a valid regular expression: {e}"))?),
+      None => None,
+    },
+    context: number(args, "context").unwrap_or(0).min(20),
+    force: args.get("force").and_then(Value::as_bool).unwrap_or(false),
+  })
 }
 
 pub fn read_many(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
@@ -338,7 +456,16 @@ pub fn read_many(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<Strin
       out.push_str(&format!("{path}  skipped (output limit reached)\n\n"));
       continue;
     }
-    match read_one(&root, &path, from, to, MAX_OUT - out.len(), ctx.seen) {
+    match read_one(
+      &root,
+      &path,
+      from,
+      to,
+      MAX_OUT - out.len(),
+      ctx.seen,
+      ctx.copies,
+      &ReadOpts::default(),
+    ) {
       Ok(s) => out.push_str(&s),
       Err(e) => out.push_str(&format!("{e:#}\n")),
     }
