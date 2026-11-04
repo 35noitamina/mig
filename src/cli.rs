@@ -62,6 +62,7 @@ For AI tools:
   mcp                Run as an MCP server over stdio
   ws                 Folders the GUI window and the MCP server work in (ls, add, rm, rename)
   run                Run a command or script through mig's safety check (exec, script, check, log, pending, approve, deny)
+  tell               Leave a note for an AI agent (it arrives through wait_events or the channel)
   lock, unlock       Take Claude Code's own command tools away in this repository (or give them back)
 
 GUI:
@@ -167,6 +168,13 @@ enum Cmd {
   /// Run a command or script through the same safety check AI agents go through
   #[command(subcommand)]
   Run(RunCmd),
+  /// Leave a note for an AI agent working in this repository
+  Tell {
+    text: String,
+    /// Agent name, or * for whoever is working (default)
+    #[arg(long, default_value = "*")]
+    to: String,
+  },
   /// Take Claude Code's own command tools (Bash, PowerShell, Monitor) away in this repository
   Lock {
     /// Write to .claude/settings.json (shared with the team) instead of settings.local.json
@@ -618,6 +626,7 @@ enum Action {
   Run(RunCmd),
   Lock { shared: bool, server: String, status: bool },
   Unlock,
+  Tell { text: String, to: String },
 }
 
 enum Top {
@@ -643,6 +652,7 @@ impl Cmd {
       Cmd::Run(r) => A::Run(r),
       Cmd::Lock { shared, server, status } => A::Lock { shared, server, status },
       Cmd::Unlock => A::Unlock,
+      Cmd::Tell { text, to } => A::Tell { text, to },
       Cmd::Context { diff, files, count } => A::Context(ContextOpts {
         diff,
         files,
@@ -1043,6 +1053,11 @@ fn dispatch(repo: &Repository, action: Action) -> Result<()> {
     Action::Agent(cmd) => run_agent(repo, cmd),
     Action::Run(cmd) => run_run(repo, cmd),
     Action::Lock { shared, server, status } => run_lock(repo, &server, shared, status),
+    Action::Tell { text, to } => {
+      crate::inbox::send(repo.path(), &to, &text, None, None, None)?;
+      println!("sent to {to}");
+      Ok(())
+    }
     Action::Unlock => {
       let file = crate::lock::unlock(repo)?;
       println!("unlocked: removed what mig added to {file}");

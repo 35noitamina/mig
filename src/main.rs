@@ -13,6 +13,7 @@ mod cli;
 mod config;
 #[cfg(feature = "gui")]
 mod editor;
+mod events;
 mod files;
 #[cfg(feature = "gui")]
 mod finder;
@@ -24,10 +25,10 @@ mod guard;
 mod gui;
 #[cfg(feature = "gui")]
 mod highlight;
+mod inbox;
 mod live;
 #[cfg(feature = "gui")]
 mod liveui;
-#[cfg(feature = "gui")]
 mod livewatch;
 mod lock;
 mod mcp;

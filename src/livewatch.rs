@@ -287,7 +287,10 @@ fn watch_dirs(w: &mut impl Watcher, dir: &Path, watched: &mut HashSet<PathBuf>) 
   failed
 }
 
-fn run(root: PathBuf, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: eframe::egui::Context) {
+// Called after events were sent, so a window can redraw.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
+fn run(root: PathBuf, tx: Sender<Msg>, stop: Arc<AtomicBool>, wake: Waker) {
   let Ok(repo) = repo::open(&root) else { return };
   let (ntx, nrx) = mpsc::channel();
   let mut watcher = match notify::recommended_watcher(move |r| {
@@ -352,16 +355,16 @@ fn run(root: PathBuf, tx: Sender<Msg>, stop: Arc<AtomicBool>, ctx: eframe::egui:
       }
     }
     if sent {
-      ctx.request_repaint();
+      wake();
     }
   }
 }
 
-pub fn spawn(root: PathBuf, ctx: eframe::egui::Context) -> Handle {
+pub fn spawn(root: PathBuf, wake: Waker) -> Handle {
   let (tx, rx) = mpsc::channel();
   let stop = Arc::new(AtomicBool::new(false));
   let flag = stop.clone();
-  std::thread::spawn(move || run(root, tx, flag, ctx));
+  std::thread::spawn(move || run(root, tx, flag, wake));
   Handle { rx, stop }
 }
 

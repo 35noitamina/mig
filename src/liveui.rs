@@ -172,7 +172,10 @@ impl LiveHub {
     self.sources.push(Source {
       root: root.to_path_buf(),
       name: name.to_string(),
-      handle: livewatch::spawn(root.to_path_buf(), self.ctx.clone()),
+      handle: {
+        let ctx = self.ctx.clone();
+        livewatch::spawn(root.to_path_buf(), std::sync::Arc::new(move || ctx.request_repaint()))
+      },
       note: String::new(),
       unseen: 0,
       last: None,

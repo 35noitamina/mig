@@ -84,8 +84,10 @@ fn always_file(git_dir: &Path) -> PathBuf {
 }
 
 pub fn new_id() -> String {
+  static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
   let n = crate::live::now_ms() as u64 ^ (u64::from(std::process::id()) << 20);
-  format!("{:06x}", n % 0xff_ffff)
+  let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+  format!("{:06x}", (n.wrapping_mul(31).wrapping_add(c * 7919)) % 0xff_ffff)
 }
 
 // What "always allow" remembers: the kind, the language and the exact text.
