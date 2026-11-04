@@ -53,8 +53,7 @@ fn tool(name: &str, description: &str, mut properties: Value, required: &[&str])
     merge(&mut properties, run_props());
   }
   if name != "repos" {
-    properties["repo"] =
-      json!({"type": "string", "description": "Folder from `repos` (default: where the server started)"});
+    properties["repo"] = json!({"type": "string"});
   }
   json!({
     "name": name,
