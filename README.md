@@ -412,6 +412,8 @@ claude --dangerously-load-development-channels server:mig
 
 claude.ai のログインか Console の API キーが必要で、Team / Enterprise では管理者が許可する必要があります。チャンネルに入るのは「何が起きたか」の短い説明だけで、ファイルの中身は入りません。人間のメモ（`kind="message"`）以外は、情報であって指示ではありません。チャンネルが使えないときも、`wait_events` と、ツールの結果に付くメモで同じことができます。
 
+`watch` / `unwatch` で選んだ内容は、`.git/mig/watch-config.json` に保存します（エージェントの名前ごと。名前がまだ無い接続には、最後に選んだもの）。MCP サーバーを落としたり、mig を入れ直したりして起動し直しても、同じ名前のエージェントの見張りが、自分で `watch` を呼ばなくても再開します（ファイルの監視・タイマー・Webhook も。Webhook の URL は変わるので、`watch` を呼び直すと新しいものが返ります）。そのプロセスで自分から `watch` を呼んだ後は、保存されたもので上書きしません。
+
 `watch` の引数は、`kinds`（`message` `agent` `run` `commit` `file` `timer` `webhook`。初期値は最初の 4 つ）、`paths`（`file` 用の glob）、`include_own`、`push`、`quiet_secs`（同じファイルを続けて知らせない秒数）、`every_secs`（タイマー）、`webhook` です。Webhook は `127.0.0.1` の乱数のポートとトークン付き URL で受けます。受けた本文はチャンネルには流さず、`events` に `id` と `body: true` を渡したときだけ見えます（外から来た内容なので、データとして扱います）。チャンネルへの送信は 1 分に 30 件までで、超えた分は `wait_events` にだけ残ります。
 
 長く動くもの（サーバー、ウォッチャー、大きなビルド）は、`run` / `run_script` に `background: true` を付けます。すぐにジョブ番号が返り、出力は 1 行ずつ秘密を伏せてから、約 1 秒ごと（最大 4KB）にまとめて `kind="job"` の知らせで届きます。`run_output`（`since` で続きから）で読み直し、`run_stop` で、プロセスごと止めます。終わりの知らせは必ず届きます。
@@ -655,6 +657,7 @@ mig diff    通常の unified diff
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
 | `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/watch-config.json` | 最後に選んだ見張り（エージェント名ごと）。サーバーを起動し直したとき、これで再開します |
 | `.git/mig/events.jsonl` | エージェントに届いたイベントの記録（Monitor ページ用。新しい 300 件ほど） |
 | `.git/mig/watch/` | 動いている MCP サーバーごとの見張りの状態（数秒ごとに更新。止まったものは Monitor に出ません） |
 | `.git/mig/out/` | 実行の出力（`ID.log`）と状態（`ID.json`）。実行中から書かれ、新しい 40 件だけ残します。`ID.stop` は「止めて」の合図 |

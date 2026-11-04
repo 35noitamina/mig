@@ -41,7 +41,8 @@ pub struct Event {
   shown: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sub {
   pub kinds: BTreeSet<String>,
   // Globs for file events; empty means every path.
@@ -84,6 +85,10 @@ struct Inner {
   left_out: HashMap<PathBuf, u32>,
   file_last: HashMap<(PathBuf, String), Instant>,
   own_at: HashMap<PathBuf, Instant>,
+  // This process chose its own watch (with the watch tool), so a saved one must not replace it.
+  explicit: HashSet<PathBuf>,
+  // Saved watches already looked up, by folder and agent name.
+  restored: HashSet<(PathBuf, String)>,
 }
 
 pub struct Hub {
@@ -240,7 +245,55 @@ pub fn watches(git_dir: &Path) -> Vec<WatchInfo> {
   out
 }
 
+// What each agent last chose to watch, so a restarted server picks it up again. Keyed by the agent's
+// name; "*" is the last choice of anyone (for a connection that has no session yet).
+fn config_file(git_dir: &Path) -> PathBuf {
+  git_dir.join("mig").join("watch-config.json")
+}
+
+fn load_config(git_dir: &Path) -> HashMap<String, Sub> {
+  std::fs::read_to_string(config_file(git_dir))
+    .ok()
+    .and_then(|t| serde_json::from_str(&t).ok())
+    .unwrap_or_default()
+}
+
+fn save_config(git_dir: &Path, agent: Option<&str>, sub: &Sub) {
+  let mut all = load_config(git_dir);
+  all.insert("*".into(), sub.clone());
+  if let Some(a) = agent {
+    all.insert(a.to_string(), sub.clone());
+  }
+  let file = config_file(git_dir);
+  if let Some(d) = file.parent() {
+    let _ = std::fs::create_dir_all(d);
+  }
+  if let Ok(t) = serde_json::to_string_pretty(&all) {
+    let tmp = file.with_extension("json.tmp");
+    if std::fs::write(&tmp, t).is_ok() {
+      let _ = std::fs::rename(&tmp, &file);
+    }
+  }
+}
+
 impl Hub {
+  // Applies the saved watch for `key` (an agent name, or "*") unless this process chose its own.
+  fn restore(self: &Arc<Hub>, root: &Path, name: &str, key: &str) {
+    {
+      let mut g = self.lock();
+      // The shared choice only fills in when nothing more specific has been applied yet.
+      if g.explicit.contains(root) || (key == "*" && g.subs.contains_key(root)) {
+        return;
+      }
+      if !g.restored.insert((root.to_path_buf(), key.to_string())) {
+        return;
+      }
+    }
+    if let Some(sub) = load_config(&root.join(".git")).remove(key) {
+      let _ = self.apply(root, name, sub, false);
+    }
+  }
+
   // Writes (or refreshes) this server's watch file for `root`.
   fn save_watch(&self, root: &Path) {
     let (sub, me, webhook, started) = {
@@ -288,6 +341,8 @@ impl Hub {
         left_out: HashMap::new(),
         file_last: HashMap::new(),
         own_at: HashMap::new(),
+        explicit: HashSet::new(),
+        restored: HashSet::new(),
       }),
       cv: Condvar::new(),
       notify,
@@ -299,13 +354,16 @@ impl Hub {
   }
 
   // Who this server speaks for in `root`: its own doings are not reported back to it.
-  pub fn set_me(&self, root: &Path, name: Option<&str>) {
+  pub fn set_me(self: &Arc<Hub>, root: &Path, name: Option<&str>) {
     let mut g = self.lock();
     match name {
       Some(n) => g.me.insert(root.to_path_buf(), n.to_string()),
       None => g.me.remove(root),
     };
     drop(g);
+    if let Some(n) = name {
+      self.restore(root, &repo_name(root), n);
+    }
     self.save_watch(root);
   }
 
@@ -322,12 +380,24 @@ impl Hub {
     if !self.lock().started.insert(root.to_path_buf()) {
       return;
     }
+    self.restore(root, name, "*");
     let hub = self.clone();
     let (root, name) = (root.to_path_buf(), name.to_string());
     std::thread::spawn(move || poll_loop(hub, root, name));
   }
 
+  // The `watch` tool: this process chooses its watch, and the choice is saved.
   pub fn watch(self: &Arc<Hub>, root: &Path, name: &str, sub: Sub) -> Result<String> {
+    let out = self.apply(root, name, sub.clone(), true)?;
+    let me = self.lock().me.get(root).cloned();
+    save_config(&root.join(".git"), me.as_deref(), &sub);
+    Ok(out)
+  }
+
+  fn apply(self: &Arc<Hub>, root: &Path, name: &str, sub: Sub, explicit: bool) -> Result<String> {
+    if explicit {
+      self.lock().explicit.insert(root.to_path_buf());
+    }
     for k in &sub.kinds {
       if !ALL_KINDS.contains(&k.as_str()) {
         bail!("unknown kind {k}; use {}", ALL_KINDS.join(", "));
@@ -373,17 +443,18 @@ impl Hub {
   }
 
   pub fn unwatch(&self, root: &Path) {
+    let off = Sub {
+      kinds: BTreeSet::new(),
+      push: false,
+      ..Sub::default()
+    };
     let mut g = self.lock();
-    g.subs.insert(
-      root.to_path_buf(),
-      Sub {
-        kinds: BTreeSet::new(),
-        push: false,
-        ..Sub::default()
-      },
-    );
+    g.subs.insert(root.to_path_buf(), off.clone());
+    g.explicit.insert(root.to_path_buf());
     g.files_on.remove(root);
+    let me = g.me.get(root).cloned();
     drop(g);
+    save_config(&root.join(".git"), me.as_deref(), &off);
     self.save_watch(root);
   }
 
@@ -894,6 +965,63 @@ pub fn repo_name(root: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+  #[test]
+  fn a_saved_watch_comes_back_after_a_restart() {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let root = std::env::temp_dir().join(format!(
+      "mig-watchcfg-{}-{}",
+      std::process::id(),
+      N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let first = Hub::new(Arc::new(|_| {}));
+    let sub = Sub {
+      kinds: ["message", "commit"].iter().map(|s| s.to_string()).collect(),
+      paths: vec!["src/**".into()],
+      push: false,
+      ..Sub::default()
+    };
+    first.set_me(&root, Some("alice"));
+    first.watch(&root, "r", sub).unwrap();
+    // A new server process: nothing in memory, the same folder.
+    let second = Hub::new(Arc::new(|_| {}));
+    second.ensure_started(&root, "r");
+    let got = second.sub(&root);
+    assert_eq!(got.kinds.len(), 2);
+    assert!(got.kinds.contains("commit") && !got.push);
+    // The agent's own choice wins over the shared one once its name is known.
+    first.set_me(&root, Some("bob"));
+    first
+      .watch(
+        &root,
+        "r",
+        Sub {
+          kinds: ["agent".to_string()].into(),
+          ..Sub::default()
+        },
+      )
+      .unwrap();
+    let third = Hub::new(Arc::new(|_| {}));
+    third.set_me(&root, Some("alice"));
+    assert!(third.sub(&root).kinds.contains("commit"));
+    // unwatch is remembered too.
+    first.unwatch(&root);
+    let fourth = Hub::new(Arc::new(|_| {}));
+    fourth.ensure_started(&root, "r");
+    assert!(fourth.sub(&root).kinds.is_empty());
+    // A watch chosen in this process is not replaced by a saved one.
+    let fifth = Hub::new(Arc::new(|_| {}));
+    let mine = Sub {
+      kinds: ["agent".to_string()].into(),
+      ..Sub::default()
+    };
+    fifth.watch(&root, "r", mine).unwrap();
+    fifth.set_me(&root, Some("alice"));
+    assert_eq!(fifth.sub(&root).kinds.len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+  }
+
   use super::*;
 
   fn hub() -> (Arc<Hub>, Arc<Mutex<Vec<Value>>>) {
