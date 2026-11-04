@@ -636,9 +636,11 @@ mig diff    通常の unified diff
 | `read_many` | **`files`**（パス、または `{path, from, to}` の配列） | `read` をまとめた結果。失敗したファイルがあっても他は読む |
 | `search` | **`pattern`**（正規表現）、`path`、`glob`、`context`（0〜5）、`max`（既定 50）、`ignore_case` | `パス:行:本文`（前後の行は `パス-行-本文`）。2MB 超とバイナリは対象外 |
 | `edit` | **`path`**、**`edits`**（`{old, new, all}` の配列）、`dry_run` | 小さい unified diff。`old` は 1 回だけ一致する必要があり、複数あれば行番号を出して断る。シークレットらしい `new` は拒否 |
-| `write` | **`path`**、**`content`** | `created` または `overwrote`（増減行つき）。親フォルダも作る。2MB まで |
+| `write` | **`path`**、**`content`**、`eol`（`keep` / `lf` / `crlf`） | `created` または `overwrote`（増減行つき）。親フォルダも作る。2MB まで |
 | `move` | **`from`**、**`to`** | 移動先が既にあると失敗します |
 | `delete` | **`path`**、`recursive` | 空でないフォルダは `recursive` が必要です |
+
+改行の種類（LF と CRLF）の違いは、mig が吸収します。`edit` は、`old` が LF でも CRLF でも、ファイルの改行がどちらでも（混ざっていても）一致させ、置き換えた所は、その行の改行で書きます（ほかの行は触りません）。`write` は、既存のファイルの改行に合わせます（`eol` で `lf` / `crlf` を指定すると、それにします）。`read` の見出しには、CRLF のファイルなら `CRLF`、混ざっていれば `mixed line endings` と出ます。`run_script` のコードは、CRLF を LF にしてから実行します（`cmd` 以外）。
 
 `edit` / `write` / `move` / `delete` は、その接続が最後に読んだ（または書いた）あとに対象のファイルが変わっていると、`<パス> changed since you last read it (by <誰> at <時刻>)` で断ります。読み直してからやり直してください。
 

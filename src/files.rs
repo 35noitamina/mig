@@ -171,9 +171,7 @@ fn after_write(
         .and_then(|a| std::str::from_utf8(a).ok())
         .filter(|t| t.len() <= COPY_MAX)
       {
-        Some(t) => ctx
-          .copies
-          .insert(name.clone(), (agent::hash(t.as_bytes()), t.to_string())),
+        Some(t) => ctx.copies.insert(name.clone(), (agent::hash(t.as_bytes()), to_lf(t))),
         None => ctx.copies.remove(name),
       };
     }
@@ -318,11 +316,11 @@ fn read_one(
           "{name}  {n} lines  {size}  unchanged since you read it (force=true shows it again)\n"
         ));
       }
-      if let Ok((d, added, removed)) = diff(&old, &content, &name) {
+      if let Ok((d, added, removed)) = diff(&old, &to_lf(&content), &name) {
         let (d, _) = scan::redact(&d);
         let d = d.find("@@").map_or(d.clone(), |i| d[i..].to_string());
         if d.len() * 2 < content.len() {
-          copies.insert(name.clone(), (agent::hash(&bytes), content.to_string()));
+          copies.insert(name.clone(), (agent::hash(&bytes), to_lf(&content)));
           return Ok(format!(
             "{name}  {n} lines  {size}  changed since you read it (+{added} -{removed}); only the changes:\n{d}"
           ));
@@ -391,6 +389,11 @@ fn read_one(
     last = i + 1;
   }
   let mut head = format!("{name}  {n} lines  {}", guard::fmt_size(meta.len()));
+  match detect_eol(&content) {
+    Eol::Crlf => head.push_str("  CRLF"),
+    Eol::Mixed => head.push_str("  mixed line endings"),
+    _ => {}
+  }
   if from > 1 || last < n {
     head.push_str(&format!("  (lines {from}-{last})"));
   }
@@ -401,7 +404,7 @@ fn read_one(
     if copies.len() >= COPIES_MAX {
       copies.clear();
     }
-    copies.insert(name.clone(), (agent::hash(&bytes), content.to_string()));
+    copies.insert(name.clone(), (agent::hash(&bytes), to_lf(&content)));
   }
   let mut out = format!("{head}\n{body}");
   if last < n {
@@ -556,6 +559,42 @@ fn to_crlf(s: &str) -> String {
   s.replace("\r\n", "\n").replace('\n', "\r\n")
 }
 
+fn to_lf(s: &str) -> String {
+  s.replace("\r\n", "\n")
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Eol {
+  // No line break at all.
+  None,
+  Lf,
+  Crlf,
+  Mixed,
+}
+
+fn detect_eol(s: &str) -> Eol {
+  let crlf = s.matches("\r\n").count();
+  let lf = s.matches('\n').count() - crlf;
+  match (crlf, lf) {
+    (0, 0) => Eol::None,
+    (0, _) => Eol::Lf,
+    (_, 0) => Eol::Crlf,
+    _ => Eol::Mixed,
+  }
+}
+
+// The line ending used where a match sits: the one that ends its line, else the one before it.
+fn eol_near(text: &str, start: usize) -> &'static str {
+  let ends_crlf = |nl: usize| nl > 0 && text.as_bytes()[nl - 1] == b'\r';
+  if let Some(i) = text[start..].find('\n').map(|i| i + start) {
+    return if ends_crlf(i) { "\r\n" } else { "\n" };
+  }
+  match text[..start].rfind('\n') {
+    Some(i) if ends_crlf(i) => "\r\n",
+    _ => "\n",
+  }
+}
+
 fn line_of(text: &str, at: usize) -> usize {
   text[..at].matches('\n').count() + 1
 }
@@ -588,18 +627,18 @@ fn parse_edits(args: &Value) -> Result<Vec<Edit>> {
 
 // Every edit must match exactly (once, unless `all`); otherwise nothing is changed.
 fn apply_edits(original: &str, edits: &[Edit]) -> Result<String> {
-  let crlf = original.contains("\r\n");
   let mut cur = original.to_string();
   for (k, e) in edits.iter().enumerate() {
-    let (old, new) = if crlf {
-      (to_crlf(&e.old), to_crlf(&e.new))
-    } else {
-      (e.old.clone(), e.new.clone())
-    };
+    // Line endings do not have to match: `old` may use LF or CRLF whatever the file uses, and each
+    // replacement is written with the ending of the place it lands.
+    let old = to_lf(&e.old);
+    let new = to_lf(&e.new);
     if old.is_empty() {
       bail!("edit {}: old is empty", k + 1);
     }
-    let at: Vec<usize> = cur.match_indices(&old).map(|(i, _)| i).collect();
+    let re = regex::Regex::new(&regex::escape(&old).replace('\n', "\\r?\\n"))
+      .map_err(|_| anyhow!("edit {}: the text is too long to match", k + 1))?;
+    let at: Vec<usize> = re.find_iter(&cur).map(|m| m.start()).collect();
     if at.is_empty() {
       let mut msg = format!("edit {}: the text was not found; nothing was changed.", k + 1);
       if e.old.contains(MASK) {
@@ -627,11 +666,19 @@ fn apply_edits(original: &str, edits: &[Edit]) -> Result<String> {
         lines.join(", ")
       );
     }
-    cur = if e.all {
-      cur.replace(&old, &new)
-    } else {
-      cur.replacen(&old, &new, 1)
-    };
+    let mut out = String::with_capacity(cur.len());
+    let mut last = 0;
+    for m in re.find_iter(&cur).take(if e.all { usize::MAX } else { 1 }) {
+      out.push_str(&cur[last..m.start()]);
+      if eol_near(&cur, m.start()) == "\r\n" {
+        out.push_str(&to_crlf(&new));
+      } else {
+        out.push_str(&new);
+      }
+      last = m.end();
+    }
+    out.push_str(&cur[last..]);
+    cur = out;
   }
   Ok(cur)
 }
@@ -715,7 +762,7 @@ pub fn edit(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
     &name,
     &edits.iter().map(|e| e.new.as_str()).collect::<Vec<_>>().join("\n"),
   )?;
-  let (patch, added, removed) = diff(&original, &updated, &name)?;
+  let (patch, added, removed) = diff(&to_lf(&original), &to_lf(&updated), &name)?;
   if flag(args, "dry_run") {
     return Ok(format!("would edit {name}  +{added} -{removed}\n{patch}"));
   }
@@ -750,6 +797,29 @@ pub fn write(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
   let previous = std::fs::read(&path).ok();
   guard_fresh(repo, ctx, &name, previous.as_deref())?;
   refuse_secrets(repo, &name, &content)?;
+  // Keep the file's own line endings (or use the one asked for), whatever the new text uses.
+  let want = match text(args, "eol").as_deref() {
+    Some("lf") => Some(false),
+    Some("crlf") => Some(true),
+    None | Some("keep") => match previous
+      .as_deref()
+      .and_then(|p| std::str::from_utf8(p).ok())
+      .map(detect_eol)
+    {
+      Some(Eol::Crlf) => Some(true),
+      Some(Eol::Lf) => Some(false),
+      _ => None,
+    },
+    Some(o) => bail!("eol is lf, crlf or keep, not {o}"),
+  };
+  let (content, converted) = match want {
+    Some(crlf) => {
+      let c = if crlf { to_crlf(&content) } else { to_lf(&content) };
+      let changed = c != content;
+      (c, changed)
+    }
+    None => (content, false),
+  };
   live::record(repo, "mig write", &name, ctx.agent_name());
   write_atomic(&path, content.as_bytes())?;
   let summary = match previous.as_ref().map(|p| std::str::from_utf8(p)) {
@@ -759,8 +829,15 @@ pub fn write(repo: &Repository, args: &Value, ctx: &mut Ctx) -> Result<String> {
       guard::fmt_size(content.len() as u64)
     ),
     Some(Ok(old)) => {
-      let (_, added, removed) = diff(old, &content, &name)?;
-      format!("overwrote {name}  +{added} -{removed}")
+      let (_, added, removed) = diff(&to_lf(old), &to_lf(&content), &name)?;
+      format!(
+        "overwrote {name}  +{added} -{removed}{}",
+        if converted {
+          "  (line endings adjusted to match the file)"
+        } else {
+          ""
+        }
+      )
     }
     Some(Err(_)) => format!("overwrote {name} (was binary)"),
   };
@@ -919,6 +996,44 @@ mod tests {
       apply_edits(t, &edits(&[("a\nb", "x\ny", false)])).unwrap(),
       "x\r\ny\r\nc\r\n"
     );
+  }
+
+  #[test]
+  fn old_text_may_use_either_line_ending() {
+    // An LF file, text pasted with CRLF.
+    assert_eq!(
+      apply_edits("a\nb\nc\n", &edits(&[("a\r\nb", "x\r\ny", false)])).unwrap(),
+      "x\r\ny\nc\n".replace("\r\n", "\n")
+    );
+    // A CRLF file, text with LF, and a replacement that adds lines.
+    assert_eq!(
+      apply_edits("a\r\nb\r\n", &edits(&[("b", "b\nc", false)])).unwrap(),
+      "a\r\nb\r\nc\r\n"
+    );
+  }
+
+  #[test]
+  fn mixed_files_keep_each_lines_own_ending() {
+    let t = "one\r\ntwo\nthree\r\n";
+    let out = apply_edits(t, &edits(&[("two", "2", false), ("three", "3", false)])).unwrap();
+    assert_eq!(out, "one\r\n2\n3\r\n");
+    // A multi-line match in the LF part is replaced with LF.
+    let out = apply_edits("a\nb\nc\r\n", &edits(&[("a\nb", "x\ny\nz", false)])).unwrap();
+    assert_eq!(out, "x\ny\nz\nc\r\n");
+  }
+
+  #[test]
+  fn every_match_gets_the_ending_of_its_own_line() {
+    let out = apply_edits("k\r\nk\n", &edits(&[("k", "k\nk", true)])).unwrap();
+    assert_eq!(out, "k\r\nk\r\nk\nk\n");
+  }
+
+  #[test]
+  fn endings_are_detected() {
+    assert_eq!(detect_eol("a"), Eol::None);
+    assert_eq!(detect_eol("a\n"), Eol::Lf);
+    assert_eq!(detect_eol("a\r\nb\r\n"), Eol::Crlf);
+    assert_eq!(detect_eol("a\r\nb\n"), Eol::Mixed);
   }
 
   #[test]

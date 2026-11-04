@@ -398,7 +398,13 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
     Kind::Argv(a) => (runner::find_program(&a[0], &cwd)?, a[1..].to_vec()),
     Kind::Script { lang, name, code, args } => {
       let it = runner::interpreter(*lang, name)?;
-      let tmp = TempScript::write(repo.path(), it.ext, code)?;
+      // A script written with CRLF breaks sh, bash, python and the like.
+      let code = if matches!(lang, Lang::Cmd) {
+        code.clone()
+      } else {
+        code.replace("\r\n", "\n")
+      };
+      let tmp = TempScript::write(repo.path(), it.ext, &code)?;
       let mut full = it.before.clone();
       full.push(tmp.path.to_string_lossy().into_owned());
       full.extend(args.iter().cloned());

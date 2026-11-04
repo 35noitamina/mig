@@ -133,7 +133,7 @@ fn tools() -> Vec<Value> {
     tool(
       "write",
       "Create a file or replace it entirely; missing folders are created. Refuses content that looks like a secret. Prefer edit for small changes.",
-      json!({"path": {"type": "string"}, "content": {"type": "string"}}),
+      json!({"path": {"type": "string"}, "content": {"type": "string"}, "eol": {"type": "string", "enum": ["keep", "lf", "crlf"], "description": "Line endings; default keep (an existing file keeps its own)"}}),
       &["path", "content"],
     ),
     tool(
