@@ -35,6 +35,8 @@ struct FinishDialog {
 pub enum Action {
   // Show this folder's Live tab, filtered to the agent.
   Live { root: PathBuf, agent: String },
+  // Write a note to the agent.
+  Message { root: PathBuf, agent: String },
   Changed,
 }
 
@@ -155,6 +157,16 @@ impl AgentsView {
                     id: s.id.clone(),
                     name: s.name.clone(),
                     message: String::new(),
+                  });
+                }
+                if ui
+                  .button("Message…")
+                  .on_hover_text("Leave a note for this agent (it gets it with its next tool call)")
+                  .clicked()
+                {
+                  action = Some(Action::Message {
+                    root: row.root.clone(),
+                    agent: s.name.clone(),
                   });
                 }
                 if ui

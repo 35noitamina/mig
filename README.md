@@ -177,6 +177,14 @@ Claude Code は、起動し直す（または `/mcp` で再接続する）と反
 
 ロックの前に、mig の MCP サーバーを Claude Code に登録してください（`claude mcp add --scope user mig -- mig mcp`）。登録していないと、Claude はそのリポジトリでコマンドを何も実行できなくなります（`mig lock` は、登録が見つからないときに警告します）。
 
+#### AI への連絡 — `mig tell`
+
+| コマンド | 内容 |
+|---|---|
+| `mig tell [--to NAME] TEXT` | 作業中の AI エージェントへ、メモを残します（`--to` を省略すると、聞いているエージェントのだれか）。`wait_events` かチャンネルで届き、そうでなくても次のツールの結果に付いて届きます |
+
+GUI では、エディタで **Ctrl+Shift+Enter**（開いているファイル・行・選択した文字がメモに付きます）、Agents ページの **Message…** からも送れます。エージェントが `say` で残したメモは、GUI の Approvals ページに出ます（`attention` のときはデスクトップ通知も出ます）。
+
 #### AI ツール向け
 
 | コマンド | 内容 |
@@ -362,11 +370,31 @@ claude mcp add --scope user mig -- mig mcp     # どのプロジェクトでも
 - エージェントセッション: `agent_start`、`checkpoint`、`agent_finish`、`agent_abort`
 - ファイル操作: `ls`、`read`、`read_many`、`search`、`edit`、`write`、`move`、`delete`
 
+- コマンドの実行: `run`、`run_script`、`run_check`、`run_output`、`run_stop`
+- 知らせ: `watch`、`unwatch`、`wait_events`、`events`、`say`
+
 `save` はシークレットや巨大ファイルがあると拒否し、`diff` と `context` の出力ではシークレットを伏せ字にします。
 
 ファイル操作のツールは、標準の filesystem サーバーより少ないやり取りと文字数で使えるように作ってあります。`.gitignore` に従い、行の範囲を指定して読め、中身を正規表現で検索でき、編集は完全一致の置換（複数まとめて、全部成功か全部失敗）です。常にリポジトリの中だけを対象にし、`.git` には触れません。読むときはシークレットを `[REDACTED]` に伏せ、書き込む内容にシークレットが混ざっていたら断ります。エージェントセッションの途中なら、書き込み・移動・削除のたびに自動でチェックポイントを作り、そのセッションの作業として記録するので、`agent_abort` で元に戻せます。
 
 MCP の接続 1 つが、エージェント 1 人です。`agent_start` で始めたセッションは、その接続のものになります。`agent_finish` / `agent_abort` / `checkpoint` は、`name` を省略すると自分のセッションに対して動きます。
+
+#### 知らせとチャンネル
+
+AI が人間や他のエージェントの動きを知る方法が 2 つあります。
+
+1. `wait_events`: 呼ぶと、何か起きるまで待って返します（人間からのメモ、他のエージェントの開始と終了、他の人の `run`、新しいコミット。`watch` で、ファイルの変更・タイマー・Webhook も足せます）。Claude Code では、2 分を超える待ちは背景のタスクになり、終わると知らせが来ます。
+2. チャンネル: mig を「チャンネル」として読み込むと、同じ知らせが `<channel source="mig" kind="…">` として、会話に直接届きます（Claude Code の research preview の機能です）。自作のチャンネルは、次のように起動します。
+
+```sh
+claude --dangerously-load-development-channels server:mig
+```
+
+claude.ai のログインか Console の API キーが必要で、Team / Enterprise では管理者が許可する必要があります。チャンネルに入るのは「何が起きたか」の短い説明だけで、ファイルの中身は入りません。人間のメモ（`kind="message"`）以外は、情報であって指示ではありません。チャンネルが使えないときも、`wait_events` と、ツールの結果に付くメモで同じことができます。
+
+`watch` の引数は、`kinds`（`message` `agent` `run` `commit` `file` `timer` `webhook`。初期値は最初の 4 つ）、`paths`（`file` 用の glob）、`include_own`、`push`、`quiet_secs`（同じファイルを続けて知らせない秒数）、`every_secs`（タイマー）、`webhook` です。Webhook は `127.0.0.1` の乱数のポートとトークン付き URL で受けます。受けた本文はチャンネルには流さず、`events` に `id` と `body: true` を渡したときだけ見えます（外から来た内容なので、データとして扱います）。チャンネルへの送信は 1 分に 30 件までで、超えた分は `wait_events` にだけ残ります。
+
+長く動くもの（サーバー、ウォッチャー、大きなビルド）は、`run` / `run_script` に `background: true` を付けます。すぐにジョブ番号が返り、出力は 1 行ずつ秘密を伏せてから、約 1 秒ごと（最大 4KB）にまとめて `kind="job"` の知らせで届きます。`run_output`（`since` で続きから）で読み直し、`run_stop` で、プロセスごと止めます。終わりの知らせは必ず届きます。
 
 ### 設定
 
@@ -569,8 +597,15 @@ mig diff    通常の unified diff
 | `agent_start` | `name` | セッションの開始メッセージ。他のエージェントがいれば、その名前 |
 | `checkpoint` | `message`、`name` | `checkpoint <ハッシュ>`、または変更が無い旨 |
 | `agent_finish` | **`message`**、`name` | 終了メッセージと新しい HEAD。コミットしなかった他の人の変更があれば、その数 |
-| `run` | **`argv`**（プログラムと引数のリスト）、`cwd`、`timeout` | `exit 0 in 3.2s` と出力（先頭と末尾、シークレットは伏せ字）、警告、変わったファイル、チェックポイント。拒否されたときは `isError` で理由 |
-| `run_script` | **`lang`**、**`code`**、`args`、`cwd`、`timeout` | `run` と同じ。コードは一時ファイルに書いて実行し、消します |
+| `run` | **`argv`**（プログラムと引数のリスト）、`cwd`、`timeout`、`background` | `exit 0 in 3.2s` と出力（先頭と末尾、シークレットは伏せ字）、警告、変わったファイル、チェックポイント。拒否されたときは `isError` で理由 |
+| `run_script` | **`lang`**、**`code`**、`args`、`cwd`、`timeout`、`background` | `run` と同じ。コードは一時ファイルに書いて実行し、消します |
+| `run_output` | `job`、`since` | 背景のジョブの出力（`since` から）と状態。`job` を省略するとジョブの一覧 |
+| `run_stop` | **`job`** | 背景のジョブを、プロセスごと止める |
+| `watch` | `kinds`、`paths`、`include_own`、`push`、`quiet_secs`、`every_secs`、`webhook` | 何を知らせるかを決めた結果（Webhook の URL を含む） |
+| `unwatch` | なし | 知らせを止める |
+| `wait_events` | `timeout`（1〜1500 秒、既定 60）、`max` | 起きたことの一覧。なければ「何もなかった」 |
+| `events` | `since`、`limit`、`id`、`body` | 最近の知らせ。`id` で 1 件を詳しく |
+| `say` | **`text`**、`level`（`info` / `attention`） | 人間への短いメモ（GUI に出ます） |
 | `run_check` | `argv`、または `lang` と `code` | 実行せずに、実行される / 承認待ち / 拒否の判定と、見つかった理由 |
 | `agent_abort` | `name` | 終了メッセージ、元に戻したファイルの数、捨てた作業の保存先。他の人があとから変えたため戻さなかったファイルがあれば、その一覧 |
 | `ls` | `path`（既定 `.`）、`depth`（1〜6、既定 1） | `.gitignore` を除いた一覧。ファイルはサイズと変更記号（`M` / `A` / `?`）つき |
@@ -594,6 +629,7 @@ mig diff    通常の unified diff
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
 | `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/inbox/` / `outbox/` | 人間から AI へのメモ（`mig tell`、GUI）と、AI から人間へのメモ（`say`）。1 件 1 ファイルで、1 日たつと消えます |
 | `.git/mig/lock.json` | `mig lock` が Claude Code の設定に足した項目（`unlock` で、これだけを消すため） |
 | `.git/mig/run-allow.json` | 「Always allow」で覚えた実行（正確なコマンドの指紋） |
 | `.git/mig/live.jsonl` | MCP のファイル操作（`edit` / `write` / `move` / `delete`）の短いログ。GUI の Live タブが「どのツールで書き込まれたか」を表示するために、直近の数秒分だけ読みます |
@@ -640,6 +676,7 @@ cargo fmt && cargo clippy
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
 | `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` / `lock.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
+| `events.rs` / `inbox.rs` / `jobs.rs` / `tellui.rs` | 知らせ（`wait_events`・チャンネル・Webhook・タイマー）、人間と AI のメモ、背景のジョブ、「Send to Claude」のダイアログ |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。

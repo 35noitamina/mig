@@ -65,6 +65,7 @@ struct App {
   leave: bool,
   publish: Option<PublishDialog>,
   settings: Option<SettingsDialog>,
+  tell: Option<crate::tellui::Dialog>,
   mode: Mode,
   editor: Editor,
   auto_lines: usize,
@@ -584,6 +585,12 @@ impl eframe::App for Shell {
             self.page = Page::Folder(i);
           }
         }
+        Some(agentsui::Action::Message { root, agent }) => {
+          if let Some(i) = self.apps.iter().position(|a| a.root == root) {
+            self.apps[i].tell = Some(self.apps[i].new_tell(Some(agent), None, None, None));
+            self.page = Page::Folder(i);
+          }
+        }
         Some(agentsui::Action::Changed) => {
           for app in &mut self.apps {
             app.refresh();
@@ -711,6 +718,7 @@ impl App {
       leave: false,
       publish: None,
       settings: None,
+      tell: None,
       mode: Mode::Editor,
       editor,
       auto_lines: cfg.editor.auto_commit_lines,
@@ -1535,8 +1543,34 @@ impl App {
     }
   }
 
+  fn new_tell(
+    &self,
+    to: Option<String>,
+    file: Option<String>,
+    lines: Option<(usize, usize)>,
+    selection: Option<String>,
+  ) -> crate::tellui::Dialog {
+    let folder = self
+      .root
+      .file_name()
+      .map(|n| n.to_string_lossy().into_owned())
+      .unwrap_or_default();
+    crate::tellui::Dialog::new(self.root.clone(), folder, to, file, lines, selection)
+  }
+
   fn dialogs(&mut self, ctx: &egui::Context) {
     self.publish_dialog(ctx);
+    if let Some(d) = &mut self.tell {
+      match crate::tellui::show(d, ctx) {
+        crate::tellui::Outcome::Open => {}
+        crate::tellui::Outcome::Closed => self.tell = None,
+        crate::tellui::Outcome::Sent(m) => {
+          self.tell = None;
+          self.status = Ok(m);
+        }
+        crate::tellui::Outcome::Failed(e) => self.status = Err(e),
+      }
+    }
     if let Some((r, changed)) = self.ai.windows(ctx, &self.repo) {
       if changed {
         self.selected.clear();
@@ -1789,6 +1823,9 @@ impl App {
         let mut saved = false;
         for ev in self.editor.ui(ui) {
           match ev {
+            editor::Event::Tell { file, lines, selection } => {
+              self.tell = Some(self.new_tell(None, Some(file), Some(lines), selection));
+            }
             editor::Event::Saved => saved = true,
             editor::Event::Error(e) => self.status = Err(e),
           }

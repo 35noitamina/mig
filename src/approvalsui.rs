@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, RichText};
 
 use crate::approval::{self, Decision, Pending};
+use crate::inbox::{self, Say};
 use crate::runtool::{self, LogEntry};
 
 const REFRESH: Duration = Duration::from_millis(700);
@@ -18,6 +19,11 @@ struct Row {
   p: Pending,
 }
 
+struct SayRow {
+  folder: String,
+  s: Say,
+}
+
 struct RunRow {
   folder: String,
   e: LogEntry,
@@ -27,6 +33,7 @@ struct RunRow {
 pub struct ApprovalsView {
   rows: Vec<Row>,
   runs: Vec<RunRow>,
+  says: Vec<SayRow>,
   loaded: Option<Instant>,
   seen: HashSet<String>,
   first_load: bool,
@@ -60,8 +67,15 @@ impl ApprovalsView {
     self.loaded = Some(Instant::now());
     let mut rows = Vec::new();
     let mut runs = Vec::new();
+    let mut says = Vec::new();
     for (root, folder) in folders {
       let git = root.join(".git");
+      for s in inbox::says(&git) {
+        says.push(SayRow {
+          folder: folder.clone(),
+          s,
+        });
+      }
       for p in approval::pending(&git) {
         rows.push(Row {
           root: root.clone(),
@@ -79,6 +93,16 @@ impl ApprovalsView {
     rows.sort_by_key(|r| r.p.ts);
     runs.sort_by_key(|r| std::cmp::Reverse(r.e.ts));
     runs.truncate(SHOWN_RUNS);
+    says.sort_by_key(|r| std::cmp::Reverse(r.s.ts));
+    for r in &says {
+      if self.seen.insert(r.s.id.clone()) && self.first_load && r.s.level == "attention" {
+        let who = r.s.agent.as_deref().unwrap_or("An agent");
+        notify(
+          &format!("mig: {who} ({})", r.folder),
+          &r.s.text.chars().take(200).collect::<String>(),
+        );
+      }
+    }
     for r in &rows {
       if self.seen.insert(r.p.id.clone()) && self.first_load {
         let who = r.p.agent.as_deref().unwrap_or("An agent");
@@ -92,6 +116,7 @@ impl ApprovalsView {
     self.first_load = true;
     self.rows = rows;
     self.runs = runs;
+    self.says = says;
   }
 
   pub fn ui(&mut self, ui: &mut egui::Ui, folders: &[(PathBuf, String)]) {
@@ -182,6 +207,20 @@ impl ApprovalsView {
               });
           });
           ui.add_space(4.0);
+        }
+
+        if !self.says.is_empty() {
+          ui.add_space(10.0);
+          ui.label(RichText::new("Notes from agents").strong());
+          for r in self.says.iter().take(20) {
+            let who = r.s.agent.as_deref().unwrap_or("an agent");
+            let color = if r.s.level == "attention" { Color32::from_rgb(225, 170, 80) } else { ui.visuals().text_color() };
+            ui.horizontal_wrapped(|ui| {
+              ui.label(RichText::new(clock(r.s.ts)).weak().monospace().small());
+              ui.label(RichText::new(format!("{} · {who}", r.folder)).weak().small());
+              ui.label(RichText::new(&r.s.text).color(color));
+            });
+          }
         }
 
         ui.add_space(10.0);

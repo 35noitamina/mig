@@ -128,6 +128,7 @@ pub fn say(git_dir: &Path, agent: Option<&str>, text: &str, level: &str) -> Resu
 }
 
 // Notes agents left for the person, oldest first. Old ones are removed.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub fn says(git_dir: &Path) -> Vec<Say> {
   let d = dir(git_dir, "outbox");
   let Ok(rd) = std::fs::read_dir(&d) else {

@@ -41,6 +41,7 @@ pub enum Sign {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct Line {
   pub sign: Sign,
   pub old: Option<u32>,
@@ -48,6 +49,7 @@ pub struct Line {
   pub text: String,
 }
 
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
 pub struct Event {
   pub id: u64,
   pub at: DateTime<Local>,
@@ -69,6 +71,7 @@ pub struct Event {
 
 pub enum Msg {
   Event(Box<Event>),
+  #[cfg_attr(not(feature = "gui"), allow(dead_code))]
   Note(String),
 }
 

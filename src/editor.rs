@@ -152,6 +152,12 @@ fn pipe(src: Option<impl Read + Send + 'static>, out: Output, ctx: egui::Context
 }
 
 pub enum Event {
+  // Ctrl+Shift+Enter: the person wants to tell an agent something about this place.
+  Tell {
+    file: String,
+    lines: (usize, usize),
+    selection: Option<String>,
+  },
   Saved,
   Error(String),
 }
@@ -451,6 +457,11 @@ impl Editor {
         i.consume_key(Modifiers::SHIFT, Key::F5),
       )
     });
+    if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Enter)) {
+      if let Some((file, lines, selection)) = self.place(&ctx) {
+        events.push(Event::Tell { file, lines, selection });
+      }
+    }
     // The Shift variant goes first: a plain Ctrl+F pattern would also match Ctrl+Shift+F.
     let (find_all, find_here, next, prev, esc) = ctx.input_mut(|i| {
       (
@@ -717,6 +728,24 @@ impl Editor {
       .tabs
       .get(self.active)
       .is_some_and(|t| matches!(t.body, Body::Text { .. }) && (!t.rich || t.kind == Some(viewer::Kind::Markdown)))
+  }
+
+  // The open file, the lines the caret or selection covers, and the selected text.
+  fn place(&self, ctx: &egui::Context) -> Option<(String, (usize, usize), Option<String>)> {
+    let t = self.tabs.get(self.active)?;
+    let Body::Text { text, .. } = &t.body else { return None };
+    let r = egui::TextEdit::load_state(ctx, code_id(&t.path)).and_then(|s| s.cursor.char_range());
+    let (a, b) = match r {
+      Some(r) => {
+        let (p, q): (usize, usize) = (r.primary.index.into(), r.secondary.index.into());
+        (p.min(q), p.max(q))
+      }
+      None => (0, 0),
+    };
+    let line_of = |idx: usize| text.chars().take(idx).filter(|c| *c == '\n').count() + 1;
+    let picked: String = text.chars().skip(a).take(b - a).collect();
+    let selection = (!picked.trim().is_empty()).then_some(picked);
+    Some((t.path.clone(), (line_of(a), line_of(b)), selection))
   }
 
   fn selected_text(&self, ctx: &egui::Context) -> Option<String> {

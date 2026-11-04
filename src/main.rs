@@ -49,6 +49,8 @@ mod setup;
 mod sizeui;
 mod split;
 #[cfg(feature = "gui")]
+mod tellui;
+#[cfg(feature = "gui")]
 mod viewer;
 #[cfg(feature = "gui")]
 mod welcome;

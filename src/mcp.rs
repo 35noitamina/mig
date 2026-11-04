@@ -832,3 +832,15 @@ pub fn serve(dir: &Path) -> Result<()> {
   }
   Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn newer_protocol_revisions_get_one_the_server_knows() {
+    assert_eq!(negotiate(Some("2026-07-28")), "2025-06-18");
+    assert_eq!(negotiate(Some("2024-11-05")), "2024-11-05");
+    assert_eq!(negotiate(None), "2025-06-18");
+  }
+}
