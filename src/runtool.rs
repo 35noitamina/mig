@@ -11,6 +11,7 @@ use git2::Repository;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::approval::{self, Answer, Pending};
 use crate::config::{self, RunSection};
 use crate::runcheck::{self, Lang, Level, Report, Spec, Verdict};
 use crate::runner::{self, Params, TempScript};
@@ -260,8 +261,16 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
   let cfg: RunSection = config::load(repo)?.run;
   let cwd = runner::ensure_inside(&root, &root.join(req.cwd.as_deref().unwrap_or(".")))?;
   let report = runcheck::check(&spec_of(&req.kind), &cfg, Some(&root));
-  let verdict = runcheck::verdict(&report, cfg.mode);
+  let mut verdict = runcheck::verdict(&report, cfg.mode);
   let (summary, kind_name) = summary_of(&req.kind);
+  let (code_text, lang_text) = match &req.kind {
+    Kind::Argv(a) => (a.join(" "), None),
+    Kind::Script { name, code, .. } => (code.clone(), Some(name.clone())),
+  };
+  let always = approval::key(kind_name, lang_text.as_deref(), &code_text);
+  if verdict == Verdict::Ask && approval::is_always(repo.path(), &always) {
+    verdict = Verdict::Run;
+  }
   let mut entry = LogEntry {
     ts: live::now_ms(),
     agent: agent.map(|a| a.name.clone()),
@@ -282,13 +291,43 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
       bail!("{}", blocked_text(&report));
     }
     Verdict::Ask => {
-      entry.verdict = "needs approval".into();
-      entry.tail = tail_of(&explain(&report));
-      append_log(repo.path(), &entry);
-      bail!(
-        "this needs a person's approval, and mig cannot ask for it yet. Nothing was run.\n{}",
-        explain(&report)
-      );
+      let id = approval::new_id();
+      let wait = cfg.approval_wait_secs.max(1);
+      approval::create(
+        repo.path(),
+        &Pending {
+          id: id.clone(),
+          ts: chrono::Utc::now().timestamp(),
+          agent: agent.map(|a| a.name.clone()),
+          kind: kind_name.into(),
+          lang: lang_text.clone(),
+          code: code_text.clone(),
+          cwd: cwd
+            .strip_prefix(&root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_default(),
+          notes: report.findings.iter().map(Into::into).collect(),
+          wait_secs: wait,
+          status: "pending".into(),
+        },
+      )?;
+      let answer = approval::wait(repo.path(), &id, Duration::from_secs(wait));
+      match answer {
+        Answer::Approved => entry.findings.push("approved".into()),
+        Answer::Denied => {
+          entry.verdict = "denied".into();
+          append_log(repo.path(), &entry);
+          bail!("a person denied this. Nothing was run.\n{}", explain(&report));
+        }
+        Answer::TimedOut => {
+          entry.verdict = "no answer".into();
+          append_log(repo.path(), &entry);
+          bail!(
+            "nobody approved this within {wait} seconds, so nothing was run. It needs a person's approval (mig GUI, Approvals, or `mig run approve`).\n{}",
+            explain(&report)
+          );
+        }
+      }
     }
     Verdict::Run => {}
   }

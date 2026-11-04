@@ -61,7 +61,7 @@ For AI tools:
   context            Markdown overview of the repository, secrets redacted
   mcp                Run as an MCP server over stdio
   ws                 Folders the GUI window and the MCP server work in (ls, add, rm, rename)
-  run                Run a command or script through mig's safety check (exec, script, check, log)
+  run                Run a command or script through mig's safety check (exec, script, check, log, pending, approve, deny)
 
 GUI:
   gui [here | PATH]  Open the GUI (welcome screen, or the repository in PATH)
@@ -222,6 +222,17 @@ enum RunCmd {
     #[arg(short = 'n', default_value_t = 20)]
     count: usize,
   },
+  /// List runs that wait for a person's approval (mode = "ask" or "strict" in .mig.toml)
+  Pending,
+  /// Let a waiting run go ahead
+  Approve {
+    id: String,
+    /// Also allow this exact command from now on
+    #[arg(long)]
+    always: bool,
+  },
+  /// Refuse a waiting run
+  Deny { id: String },
 }
 
 #[derive(Subcommand)]
@@ -1693,6 +1704,39 @@ fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
         },
       )?;
       println!("{text}");
+    }
+    RunCmd::Pending => {
+      let list = crate::approval::pending(repo.path());
+      if list.is_empty() {
+        println!("nothing is waiting");
+      }
+      for p in list {
+        println!(
+          "{}  {}  {}",
+          paint("33", &p.id),
+          paint("36", p.agent.as_deref().unwrap_or("(unknown agent)")),
+          paint("2", &fmt_time(p.ts))
+        );
+        for n in &p.notes {
+          println!("  {} {}", paint("33", &format!("[{}]", n.rule)), n.what);
+        }
+        for l in p.code.lines().take(12) {
+          println!("  | {l}");
+        }
+      }
+    }
+    RunCmd::Approve { id, always } => {
+      let d = if always {
+        crate::approval::Decision::Always
+      } else {
+        crate::approval::Decision::Approve
+      };
+      crate::approval::decide(repo.path(), &id, d)?;
+      println!("approved {id}");
+    }
+    RunCmd::Deny { id } => {
+      crate::approval::decide(repo.path(), &id, crate::approval::Decision::Deny)?;
+      println!("denied {id}");
     }
     RunCmd::Log { count } => {
       for e in runtool::recent(repo.path(), count) {

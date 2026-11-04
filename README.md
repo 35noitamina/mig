@@ -160,6 +160,8 @@ AI エージェントが MCP の `run` / `run_script` で通る検査と同じ�
 | `mig run script LANG [FILE]` | スクリプトを実行（FILE がなければ標準入力）。`LANG` は `sh` `bash` `python` `node` `powershell` `cmd` `ruby` `perl` |
 | `mig run check -- CMD ARGS…` | 実行せずに、検査の結果だけ見る |
 | `mig run log [-n N]` | 最近の実行の一覧（エージェント名、結果、コマンド） |
+| `mig run pending` | 人間の承認を待っている実行の一覧（`.mig.toml` で `mode = "ask"` か `"strict"` のとき） |
+| `mig run approve ID [--always]` / `mig run deny ID` | 待っている実行を進める（`--always` は、その正確なコマンドを今後は確認なしにする）／断る |
 
 #### AI ツール向け
 
@@ -234,6 +236,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | 全体の画面 | できること |
 |---|---|
 | Live — all folders | 全フォルダの書き込みを時刻順に 1 つの一覧で表示します。フォルダ名とエージェント名のバッジつきで、フォルダとエージェントで絞り込めます |
+| Approvals | 承認を待っている実行（コマンドやスクリプトの全文、見つかった理由、問題の行は色つき）に、**Run**（一度だけ実行）、**Always allow**（この正確なコマンドは今後確認しない）、**Deny** を選べます。待ちが出るとレールが琥珀色になり、デスクトップ通知も出ます。下には、全フォルダの最近の実行（拒否されたものも）が並び、クリックすると出力の末尾が見られます |
 | Agents | 全フォルダのエージェントセッションの一覧です。開始・最終活動の時刻、書き込み数、書いたファイル（他の人がそのあと変えたものには印）を表示し、**Live**（そのエージェントの書き込みだけを見る）、**Finish…**（コミットにまとめる）、**Abort**（作業を取り消す）ができます |
 
 | 画面 | できること |
@@ -390,6 +393,8 @@ AI エージェントは、Claude Code の Bash の代わりに、MCP の `run`�
 - **拒否**（実行しません）: ホームやルートや `..` の再帰削除、ダウンロードしてそのまま実行（`curl … | sh`）、隠した文字列のデコード実行、`sudo` などの管理者権限、`git push`、認証情報のファイル（`~/.ssh`、`~/.aws`、`.env` など）、システムのフォルダへの書き込み、`crontab` やレジストリなどでの常駐、外部への送信（`curl -T`、`nc -e`、`scp` など）、`mig` と Claude Code の設定（`.claude/`、`.mcp.json`、`.mig.toml`）への触れ方、任意の URL からのパッケージ導入、スクリプトの中のシークレット
 - **警告**（初期値の `auto` では、そのまま実行して、結果に添えます）: ネットワークへの接続、`git reset --hard` など作業を捨てる操作、大量の削除
 - **メモ**: 環境変数の一覧表示、実行時にコードを組み立てる書き方など
+
+初期値の `mode = "auto"` では、拒否以外は自動で実行します。`mode = "ask"` にすると、警告が出た実行は、人間が承認するまで待ちます（GUI の **Approvals**、または `mig run approve`）。エージェントの呼び出しは、`approval_wait_secs`（初期値 120 秒）まで待って、答えがなければ「実行しなかった」と返します。`mode = "strict"` は、`cargo test` や `git status` のような定番のコマンド以外を、すべて承認待ちにします。「Always allow」で覚えた実行は `.git/mig/run-allow.json` に入ります。
 
 実行するときは、`*_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `ANTHROPIC_*` / `OPENAI_*` / `GITHUB_TOKEN` などの名前の環境変数を取り除きます。標準入力は空で、時間（初期値 120 秒、最大 600 秒）を超えると、プロセスごと止めます。出力は 60KB までで（先頭と末尾を残します）、シークレットは `[REDACTED]` に置き換えます。スクリプトは `.git/mig/run/` の一時ファイルに書いて、実行したら消します。
 
@@ -574,7 +579,8 @@ mig diff    通常の unified diff
 | `.git/mig/oplog.json` | undo / redo 用の操作ログ（最大 500 件） |
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
-| `.git/mig/run/` | 実行中の一時スクリプト（終わると消えます） |
+| `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/run-allow.json` | 「Always allow」で覚えた実行（正確なコマンドの指紋） |
 | `.git/mig/live.jsonl` | MCP のファイル操作（`edit` / `write` / `move` / `delete`）の短いログ。GUI の Live タブが「どのツールで書き込まれたか」を表示するために、直近の数秒分だけ読みます |
 | `.git/mig/growth.json` | サイズの推移の計算結果（次回は増えたコミット分だけ計算します） |
 | `refs/mig/agents/<名前>/start` / `base` / `cp` / `files` | セッション開始時の HEAD、開始時の作業ツリーのスナップショット、最新のチェックポイント、書いたファイルの前後の内容です。チェックポイントは `cp` から親をたどって得られます。以前の `refs/mig/agent/*` と `agent.json` は、最初に読んだときに自動で移します |
@@ -618,8 +624,8 @@ cargo fmt && cargo clippy
 | `setup.rs` / `github.rs` | リポジトリの作成・リモート・GitHub への作成 |
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
-| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
-| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
+| `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
+| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。
 

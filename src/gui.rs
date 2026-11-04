@@ -10,6 +10,7 @@ use git2::{DiffOptions, Oid, Repository};
 
 use crate::agentsui::{self, AgentsView};
 use crate::aiui::AiPanel;
+use crate::approvalsui::ApprovalsView;
 use crate::editor::{self, Editor};
 use crate::guard::{self, SaveBlocked};
 use crate::liveui::{LiveHub, Scope};
@@ -258,6 +259,7 @@ enum Page {
   Folder(usize),
   AllLive,
   Agents,
+  Approvals,
   Welcome,
 }
 
@@ -270,6 +272,7 @@ struct Shell {
   welcome: Welcome,
   hub: LiveHub,
   agents: AgentsView,
+  approvals: ApprovalsView,
   rename: Option<(usize, String)>,
 }
 
@@ -282,6 +285,7 @@ impl Shell {
       welcome,
       hub: LiveHub::new(ctx.clone()),
       agents: AgentsView::default(),
+      approvals: ApprovalsView::default(),
       rename: None,
     }
   }
@@ -349,6 +353,7 @@ impl Shell {
       Page::Folder(i) => format!("mig — {}", self.names[i]),
       Page::AllLive => "mig — Live".into(),
       Page::Agents => "mig — Agents".into(),
+      Page::Approvals => "mig — Approvals".into(),
       Page::Welcome => "mig".into(),
     }
   }
@@ -384,6 +389,23 @@ impl Shell {
       .clicked()
     {
       self.page = Page::Agents;
+    }
+    let waiting = self.approvals.count();
+    let label = if waiting > 0 {
+      format!("Approvals ({waiting})")
+    } else {
+      "Approvals".into()
+    };
+    let amber = Color32::from_rgb(225, 170, 80);
+    if ui
+      .selectable_label(
+        self.page == Page::Approvals,
+        RichText::new(label).color(if waiting > 0 { amber } else { ui.visuals().text_color() }),
+      )
+      .on_hover_text("Commands agents want to run that wait for you, and the recent runs")
+      .clicked()
+    {
+      self.page = Page::Approvals;
     }
     ui.separator();
     ui.label(RichText::new("Folders").weak().small());
@@ -488,6 +510,8 @@ impl eframe::App for Shell {
     }
     let folders = self.folders();
     self.agents.refresh(&folders, false);
+    self.approvals.refresh(&folders);
+    ctx.request_repaint_after(std::time::Duration::from_secs(1));
     for (i, app) in self.apps.iter_mut().enumerate() {
       app.live_unseen = self.hub.unseen(&app.root);
       let _ = i;
@@ -520,6 +544,7 @@ impl eframe::App for Shell {
         let sessions = (!names.is_empty()).then(|| names.join(", "));
         self.hub.ui(ui, Scope::All, sessions.as_deref());
       }
+      Page::Approvals => self.approvals.ui(ui, &folders),
       Page::Agents => match self.agents.ui(ui, &folders) {
         Some(agentsui::Action::Live { root, agent }) => {
           self.hub.focus_agent(Some(agent));

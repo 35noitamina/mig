@@ -5,6 +5,9 @@ mod agentsui;
 mod ai;
 #[cfg(feature = "gui")]
 mod aiui;
+mod approval;
+#[cfg(feature = "gui")]
+mod approvalsui;
 mod assist;
 mod cli;
 mod config;
