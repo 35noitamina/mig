@@ -245,6 +245,22 @@ enum RunCmd {
     #[arg(short = 'n', default_value_t = 20)]
     count: usize,
   },
+  /// Show a run's stored output (also while it runs); no id lists the recent runs
+  Out {
+    id: Option<String>,
+    /// Only lines matching this regular expression
+    #[arg(long)]
+    grep: Option<String>,
+    #[arg(long)]
+    head: Option<usize>,
+    #[arg(long)]
+    tail: Option<usize>,
+    /// Keep printing until the run ends
+    #[arg(short = 'f', long)]
+    follow: bool,
+  },
+  /// Stop a run that is still going
+  Stop { id: String },
   /// List runs that wait for a person's approval (mode = "ask" or "strict" in .mig.toml)
   Pending,
   /// Let a waiting run go ahead
@@ -1691,6 +1707,46 @@ fn run_ws(dir: &std::path::Path, cmd: WsCmd) -> Result<()> {
 
 fn run_run(repo: &Repository, cmd: RunCmd) -> Result<()> {
   match cmd {
+    RunCmd::Out {
+      id,
+      grep,
+      head,
+      tail,
+      follow,
+    } => {
+      let git = repo.path();
+      let Some(id) = id else {
+        println!("{}", crate::jobs::list(git));
+        return Ok(());
+      };
+      let filter = crate::outfmt::Filter {
+        grep,
+        head,
+        tail,
+        ..Default::default()
+      };
+      let mut since = 0;
+      loop {
+        let all = crate::outlog::lines(git, &id)?;
+        if follow {
+          for l in &all[since.min(all.len())..] {
+            println!("{l}");
+          }
+          since = all.len();
+        } else {
+          let shown = crate::outfmt::render(&all, &filter, false, usize::MAX);
+          print!("{}", shown.text);
+        }
+        let running = crate::outlog::meta(git, &id).is_some_and(|m| m.running());
+        if !follow || !running {
+          break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
+      }
+    }
+    RunCmd::Stop { id } => {
+      println!("{}", crate::jobs::stop(repo.path(), &id)?);
+    }
     RunCmd::Exec { cwd, timeout, argv } => {
       let done = runtool::run(
         repo,

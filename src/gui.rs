@@ -262,6 +262,7 @@ enum Page {
   AllLive,
   Agents,
   Approvals,
+  Console,
   Welcome,
 }
 
@@ -275,6 +276,7 @@ struct Shell {
   hub: LiveHub,
   agents: AgentsView,
   approvals: ApprovalsView,
+  console: crate::consoleui::ConsoleView,
   rename: Option<(usize, String)>,
 }
 
@@ -288,6 +290,7 @@ impl Shell {
       hub: LiveHub::new(ctx.clone()),
       agents: AgentsView::default(),
       approvals: ApprovalsView::default(),
+      console: Default::default(),
       rename: None,
     }
   }
@@ -356,6 +359,7 @@ impl Shell {
       Page::AllLive => "mig — Live".into(),
       Page::Agents => "mig — Agents".into(),
       Page::Approvals => "mig — Approvals".into(),
+      Page::Console => "mig — Console".into(),
       Page::Welcome => "mig".into(),
     }
   }
@@ -408,6 +412,21 @@ impl Shell {
       .clicked()
     {
       self.page = Page::Approvals;
+    }
+    let going = self.console.running();
+    if ui
+      .selectable_label(
+        self.page == Page::Console,
+        RichText::new(if going > 0 {
+          format!("Console ({going})")
+        } else {
+          "Console".into()
+        }),
+      )
+      .on_hover_text("The output of every run, live while it goes")
+      .clicked()
+    {
+      self.page = Page::Console;
     }
     ui.separator();
     ui.label(RichText::new("Folders").weak().small());
@@ -543,6 +562,7 @@ impl eframe::App for Shell {
     let folders = self.folders();
     self.agents.refresh(&folders, false);
     self.approvals.refresh(&folders);
+    self.console.refresh(&folders);
     ctx.request_repaint_after(std::time::Duration::from_secs(1));
     for (i, app) in self.apps.iter_mut().enumerate() {
       app.live_unseen = self.hub.unseen(&app.root);
@@ -577,6 +597,7 @@ impl eframe::App for Shell {
         self.hub.ui(ui, Scope::All, sessions.as_deref());
       }
       Page::Approvals => self.approvals.ui(ui, &folders),
+      Page::Console => self.console.ui(ui, &folders),
       Page::Agents => match self.agents.ui(ui, &folders) {
         Some(agentsui::Action::Live { root, agent }) => {
           self.hub.focus_agent(Some(agent));

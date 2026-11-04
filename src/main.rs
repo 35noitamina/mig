@@ -12,6 +12,8 @@ mod assist;
 mod cli;
 mod config;
 #[cfg(feature = "gui")]
+mod consoleui;
+#[cfg(feature = "gui")]
 mod editor;
 mod events;
 mod files;
