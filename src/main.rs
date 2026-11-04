@@ -1,4 +1,6 @@
 mod absorb;
+#[cfg(feature = "gui")]
+mod activity;
 mod agent;
 #[cfg(feature = "gui")]
 mod agentsui;
@@ -36,6 +38,8 @@ mod liveui;
 mod livewatch;
 mod lock;
 mod mcp;
+#[cfg(feature = "gui")]
+mod monitorui;
 mod oplog;
 mod ops;
 mod outfmt;

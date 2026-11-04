@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Vec2};
 
+use crate::activity::{Act, Src, Tracker};
 use crate::livewatch::{self, CONTEXT, Event, Handle, Kind, Msg, Sign};
+use crate::outlog;
 
 const KEEP_EVENTS: usize = 300;
 const GLOW: Duration = Duration::from_millis(1500);
@@ -40,7 +42,11 @@ struct Item {
   root: PathBuf,
   folder: String,
   ev: Event,
+  // Not a file write: a run, an approval or something an agent heard about. `ev` is then a stand-in.
+  act: Option<Act>,
 }
+
+const ACT_POLL: Duration = Duration::from_millis(700);
 
 #[derive(Clone, Copy)]
 pub enum Scope<'a> {
@@ -69,6 +75,36 @@ pub struct LiveHub {
   shown: Option<Shown>,
   agent_filter: Option<String>,
   folder_filter: Option<PathBuf>,
+  tracker: Tracker,
+  act_polled: Option<Instant>,
+  // Writes, runs, approvals, monitor.
+  show: [bool; 4],
+}
+
+fn stand_in(id: u64, a: &Act) -> Event {
+  Event {
+    id,
+    at: chrono::Local::now(),
+    arrived: Instant::now(),
+    path: a.title.clone(),
+    kind: Kind::Edited,
+    tool: a.src.label().to_string(),
+    agent: a.who.clone(),
+    added: 0,
+    removed: 0,
+    binary: false,
+    lines: Vec::new(),
+    whole: false,
+    ranges: Vec::new(),
+  }
+}
+
+fn src_color(s: Src) -> Color32 {
+  match s {
+    Src::Run => Color32::from_rgb(110, 170, 235),
+    Src::Approval => Color32::from_rgb(225, 170, 80),
+    Src::Monitor => Color32::from_rgb(170, 140, 220),
+  }
 }
 
 fn rows_for(ev: &Event, whole: bool) -> Shown {
@@ -161,6 +197,9 @@ impl LiveHub {
       shown: None,
       agent_filter: None,
       folder_filter: None,
+      tracker: Tracker::default(),
+      act_polled: None,
+      show: [true; 4],
     }
   }
 
@@ -204,12 +243,31 @@ impl LiveHub {
               root: s.root.clone(),
               folder: s.name.clone(),
               ev: *ev,
+              act: None,
             });
           }
         }
       }
       if visible.is_some_and(|v| v.covers(&s.root)) {
         s.unseen = 0;
+      }
+    }
+    if self.act_polled.is_none_or(|t| t.elapsed() >= ACT_POLL) {
+      self.act_polled = Some(Instant::now());
+      for s in &mut self.sources {
+        for a in self.tracker.poll(&s.root) {
+          self.seq += 1;
+          s.last = Some(Instant::now());
+          if !visible.is_some_and(|v| v.covers(&s.root)) {
+            s.unseen += 1;
+          }
+          self.items.push_front(Item {
+            root: s.root.clone(),
+            folder: s.name.clone(),
+            ev: stand_in(self.seq, &a),
+            act: Some(a),
+          });
+        }
       }
     }
     self.items.truncate(KEEP_EVENTS);
@@ -238,7 +296,14 @@ impl LiveHub {
   }
 
   fn matches(&self, scope: Scope, i: &Item) -> bool {
-    scope.covers(&i.root)
+    let shown = match i.act.as_ref().map(|a| a.src) {
+      None => self.show[0],
+      Some(Src::Run) => self.show[1],
+      Some(Src::Approval) => self.show[2],
+      Some(Src::Monitor) => self.show[3],
+    };
+    shown
+      && scope.covers(&i.root)
       && (matches!(scope, Scope::One(_)) || self.folder_filter.as_ref().is_none_or(|f| *f == i.root))
       && self
         .agent_filter
@@ -330,6 +395,21 @@ impl LiveHub {
         })
         .response
         .on_hover_text("Show only the writes of one agent (\"other\": tools other than mig)");
+      for (i, (label, tip)) in [
+        ("Writes", "Files written in the folders"),
+        ("Runs", "Commands and scripts started through mig, and how they ended"),
+        ("Approvals", "Runs that wait for a person"),
+        (
+          "Monitor",
+          "What the watching agents hear about: notes, other agents, commits...",
+        ),
+      ]
+      .into_iter()
+      .enumerate()
+      {
+        ui.toggle_value(&mut self.show[i], label).on_hover_text(tip);
+      }
+      ui.separator();
       if ui
         .button("Clear")
         .on_hover_text("Forget the events listed here")
@@ -402,7 +482,11 @@ impl LiveHub {
         clipped.text(
           rect.min + Vec2::new(10.0, 4.0),
           Align2::LEFT_TOP,
-          format!("{}  {}{folder}", ev.at.format("%H:%M:%S"), kind_label(ev.kind)),
+          format!(
+            "{}  {}{folder}",
+            ev.at.format("%H:%M:%S"),
+            if item.act.is_some() { "" } else { kind_label(ev.kind) }
+          ),
           small.clone(),
           weak,
         );
@@ -413,6 +497,28 @@ impl LiveHub {
           FontId::proportional(13.0),
           text,
         );
+        if let Some(act) = &item.act {
+          clipped.text(
+            egui::pos2(rect.right() - 10.0, rect.top() + 4.0),
+            Align2::RIGHT_TOP,
+            format!(
+              "{}{}",
+              act.src.label(),
+              act.who.as_ref().map(|w| format!(" · {w}")).unwrap_or_default()
+            ),
+            small,
+            src_color(act.src),
+          );
+          p.rect_filled(
+            egui::Rect::from_min_size(rect.min, Vec2::new(3.0, rect.height())),
+            0.0,
+            src_color(act.src).gamma_multiply(0.7),
+          );
+          if resp.clicked() {
+            clicked = Some(ev.id);
+          }
+          continue;
+        }
         let stat = if ev.binary {
           "binary".to_string()
         } else {
@@ -441,6 +547,45 @@ impl LiveHub {
     }
   }
 
+  fn act_detail(&self, ui: &mut egui::Ui, scope: Scope, folder: &str, root: &Path, at: String, act: &Act) {
+    ui.horizontal(|ui| {
+      if matches!(scope, Scope::All) {
+        ui.label(RichText::new(folder).weak());
+      }
+      ui.label(RichText::new(act.src.label()).color(src_color(act.src)).strong());
+      if let Some(w) = &act.who {
+        ui.label(RichText::new(w).strong());
+      }
+      ui.label(RichText::new(at).weak());
+    });
+    ui.add_space(4.0);
+    let mut text = act.text.clone();
+    if let Some(id) = &act.run {
+      let git = root.join(".git");
+      let lines = outlog::lines(&git, id).unwrap_or_default();
+      let running = outlog::meta(&git, id).is_some_and(|m| m.running());
+      if running {
+        ui.ctx().request_repaint_after(Duration::from_millis(500));
+        if ui
+          .button(RichText::new("Stop").color(Color32::from_rgb(230, 110, 110)))
+          .on_hover_text("Stop the program and everything it started")
+          .clicked()
+        {
+          let _ = outlog::request_stop(&git, id);
+        }
+      }
+      let skip = lines.len().saturating_sub(400);
+      text.push_str("\n\n");
+      text.push_str(&lines[skip..].join("\n"));
+    }
+    egui::ScrollArea::both()
+      .auto_shrink([false, false])
+      .stick_to_bottom(act.run.is_some())
+      .show(ui, |ui| {
+        ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+      });
+  }
+
   fn diff(&mut self, ui: &mut egui::Ui, scope: Scope) {
     let Some(item) = self
       .selected
@@ -451,6 +596,17 @@ impl LiveHub {
       return;
     };
     let ev = &item.ev;
+    if let Some(act) = item.act.clone() {
+      self.act_detail(
+        ui,
+        scope,
+        &item.folder.clone(),
+        &item.root.clone(),
+        ev.at.format("%H:%M:%S").to_string(),
+        &act,
+      );
+      return;
+    }
     ui.horizontal(|ui| {
       if matches!(scope, Scope::All) {
         ui.label(RichText::new(&item.folder).weak());

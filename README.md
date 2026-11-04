@@ -262,6 +262,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | Live — all folders | 全フォルダの書き込みを時刻順に 1 つの一覧で表示します。フォルダ名とエージェント名のバッジつきで、フォルダとエージェントで絞り込めます |
 | Approvals | 承認を待っている実行（コマンドやスクリプトの全文、見つかった理由、問題の行は色つき）に、**Run**（一度だけ実行）、**Always allow**（この正確なコマンドは今後確認しない）、**Deny** を選べます。待ちが出るとレールが琥珀色になり、デスクトップ通知も出ます。下には、全フォルダの最近の実行（拒否されたものも）が並び、クリックすると出力の末尾が見られます |
 | Console | 全フォルダの実行の出力を、実行中から流れるまま読めます（左で実行を選びます。`●` は実行中）。正規表現で絞り込み、**Follow** で末尾を追い、**Stop** で止められます |
+| Monitor | AI エージェントが張っている見張り（`watch` で選んだ種類・パス・タイマー・Webhook、チャンネルに流すか）と、その人に届いたイベントの一覧（種類で絞り込めます）。つながっているエージェントの数がレールに出ます |
 | Agents | 全フォルダのエージェントセッションの一覧です。開始・最終活動の時刻、書き込み数、書いたファイル（他の人がそのあと変えたものには印）を表示し、**Live**（そのエージェントの書き込みだけを見る）、**Finish…**（コミットにまとめる）、**Abort**（作業を取り消す）ができます |
 
 | 画面 | できること |
@@ -271,7 +272,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 | リポジトリ内検索 | **Ctrl/Cmd+Shift+F** で、下のパネルの **Search** が開きます。検索語（**Aa** / **.\***）とファイルの絞り込み（`*.rs` など）を入れて Enter で、`.gitignore` に従ってすべてのファイルを探します（バイナリと 2MB を超えるファイルは対象外、結果は 2000 件まで）。開いている未保存のタブは、その内容を探します。結果の行をクリックすると、そのファイルを開いて、一致を選択します |
 | ビュワー | Markdown（プレビュー）、SQLite（テーブル一覧と読み取り専用の SQL）、画像（PNG / JPEG / GIF / WebP / BMP）、その他のバイナリ（16 進ダンプ）。タブの上の **Plain** と専用表示を切り替えられます |
 | History | 履歴と差分を表示します。複数選択して Fold でき、右クリックで Reword / Split / Fold / Drop を選べます |
-| Live | リポジトリの中でファイルが書き込まれるたびに、その様子をリアルタイムで表示します。左の一覧に時刻・ファイル・`+追加行 −削除行`・やったツールとエージェント（mig の MCP なら `mig edit · alice` など、それ以外は `other`）が並び、右に差分が出ます。消えた行は赤、増えた行は緑の背景で、増えた行は書き込まれた直後に明るく光ります。**Follow** をオンにすると、書き込みのたびにそのファイルへ切り替わって、変更箇所までスクロールします。AI エージェントの作業を見守るのに向いています |
+| Live | リポジトリの中でファイルが書き込まれるたびに、その様子をリアルタイムで表示します。左の一覧に時刻・ファイル・`+追加行 −削除行`・やったツールとエージェント（mig の MCP なら `mig edit · alice` など、それ以外は `other`）が並び、右に差分が出ます。消えた行は赤、増えた行は緑の背景で、増えた行は書き込まれた直後に明るく光ります。**Follow** をオンにすると、書き込みのたびにそのファイルへ切り替わって、変更箇所までスクロールします。AI エージェントの作業を見守るのに向いています。書き込みの流れには、実行の開始と終わり（`▶` `✓` `×`）、承認待ち、見張りに届いたイベントも混ざります（上の **Writes** / **Runs** / **Approvals** / **Monitor** で出し分けます。実行を選ぶと、その出力が流れ、**Stop** で止められます） |
 | Size | リポジトリが大きくなってきた様子をグラフで表示します。横軸は「コミットごと」と「時間（日・週・月）」を切り替えられ、測るものはファイルの合計サイズ・ファイル数・行数から選べます。点にマウスを乗せるとコミットと増減が出て、クリックするとそのコミットを History で開きます |
 | ツールバー | Commit、Absorb、Sync、Undo、Redo、Repo メニュー（リポジトリの切り替え、GitHub への公開）、Settings |
 
@@ -654,6 +655,8 @@ mig diff    通常の unified diff
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
 | `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/events.jsonl` | エージェントに届いたイベントの記録（Monitor ページ用。新しい 300 件ほど） |
+| `.git/mig/watch/` | 動いている MCP サーバーごとの見張りの状態（数秒ごとに更新。止まったものは Monitor に出ません） |
 | `.git/mig/out/` | 実行の出力（`ID.log`）と状態（`ID.json`）。実行中から書かれ、新しい 40 件だけ残します。`ID.stop` は「止めて」の合図 |
 | `.git/mig/charts/` | `chart` が作った PNG / SVG（新しい 60 件まで） |
 | `.git/mig/inbox/` / `outbox/` | 人間から AI へのメモ（`mig tell`、GUI）と、AI から人間へのメモ（`say`）。1 件 1 ファイルで、1 日たつと消えます |
@@ -705,7 +708,7 @@ cargo fmt && cargo clippy
 | `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` / `lock.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
 | `outfmt.rs` / `outlog.rs` / `chart.rs` / `consoleui.rs` | 出力の整形と絞り込み、出力の保存、グラフの描画、Console ページ |
 | `events.rs` / `inbox.rs` / `jobs.rs` / `tellui.rs` | 知らせ（`wait_events`・チャンネル・Webhook・タイマー）、人間と AI のメモ、背景のジョブ、「Send to Claude」のダイアログ |
-| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
+| `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` / `activity.rs` / `monitorui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 
 テストの進め方: 実際の外部サービスには繋がず、手元に偽のサーバー（GitHub API、Anthropic / OpenAI 互換 API）を立てて確認しています。`MIG_GITHUB_API` で GitHub API の向き先を変えられます。AI の向き先は、`mig ai config --base-url` で変えます。
 

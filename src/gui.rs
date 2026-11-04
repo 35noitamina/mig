@@ -263,6 +263,7 @@ enum Page {
   Agents,
   Approvals,
   Console,
+  Monitor,
   Welcome,
 }
 
@@ -277,6 +278,7 @@ struct Shell {
   agents: AgentsView,
   approvals: ApprovalsView,
   console: crate::consoleui::ConsoleView,
+  monitor: crate::monitorui::MonitorView,
   rename: Option<(usize, String)>,
 }
 
@@ -291,6 +293,7 @@ impl Shell {
       agents: AgentsView::default(),
       approvals: ApprovalsView::default(),
       console: Default::default(),
+      monitor: Default::default(),
       rename: None,
     }
   }
@@ -360,6 +363,7 @@ impl Shell {
       Page::Agents => "mig — Agents".into(),
       Page::Approvals => "mig — Approvals".into(),
       Page::Console => "mig — Console".into(),
+      Page::Monitor => "mig — Monitor".into(),
       Page::Welcome => "mig".into(),
     }
   }
@@ -427,6 +431,21 @@ impl Shell {
       .clicked()
     {
       self.page = Page::Console;
+    }
+    let watching = self.monitor.count();
+    if ui
+      .selectable_label(
+        self.page == Page::Monitor,
+        RichText::new(if watching > 0 {
+          format!("Monitor ({watching})")
+        } else {
+          "Monitor".into()
+        }),
+      )
+      .on_hover_text("What agents are listening for, and what they were told")
+      .clicked()
+    {
+      self.page = Page::Monitor;
     }
     ui.separator();
     ui.label(RichText::new("Folders").weak().small());
@@ -563,6 +582,7 @@ impl eframe::App for Shell {
     self.agents.refresh(&folders, false);
     self.approvals.refresh(&folders);
     self.console.refresh(&folders);
+    self.monitor.refresh(&folders);
     ctx.request_repaint_after(std::time::Duration::from_secs(1));
     for (i, app) in self.apps.iter_mut().enumerate() {
       app.live_unseen = self.hub.unseen(&app.root);
@@ -598,6 +618,7 @@ impl eframe::App for Shell {
       }
       Page::Approvals => self.approvals.ui(ui, &folders),
       Page::Console => self.console.ui(ui, &folders),
+      Page::Monitor => self.monitor.ui(ui, &folders),
       Page::Agents => match self.agents.ui(ui, &folders) {
         Some(agentsui::Action::Live { root, agent }) => {
           self.hub.focus_agent(Some(agent));

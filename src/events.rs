@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use globset::Glob;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::livewatch::{self, Kind as FileKind, Msg};
@@ -86,6 +87,7 @@ struct Inner {
 }
 
 pub struct Hub {
+  started_at: i64,
   inner: Mutex<Inner>,
   cv: Condvar,
   notify: Notifier,
@@ -140,9 +142,139 @@ fn random_token() -> String {
   out
 }
 
+// What the GUI's Monitor page reads: the watches that running servers hold, and the events that
+// reached them. Each server writes a small file about itself (and refreshes it every few seconds,
+// so a server that is gone drops out), and every event it keeps is appended to one shared log.
+const LOG_KEEP: usize = 300;
+const LOG_ROTATE_AT: u64 = 192 * 1024;
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+const WATCH_ALIVE_SECS: i64 = 20;
+const LOG_TEXT: usize = 400;
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Logged {
+  pub id: u64,
+  pub pid: u32,
+  pub ts: i64,
+  pub kind: String,
+  pub actor: Option<String>,
+  pub path: Option<String>,
+  pub text: String,
+  // The agent that received it.
+  pub by: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WatchInfo {
+  pub pid: u32,
+  pub agent: Option<String>,
+  pub started: i64,
+  // Heartbeat, Unix seconds.
+  pub ts: i64,
+  pub kinds: Vec<String>,
+  pub paths: Vec<String>,
+  pub include_own: bool,
+  pub push: bool,
+  pub every_secs: Option<u64>,
+  pub webhook: bool,
+}
+
+fn log_file(git_dir: &Path) -> PathBuf {
+  git_dir.join("mig").join("events.jsonl")
+}
+
+fn watch_dir(git_dir: &Path) -> PathBuf {
+  git_dir.join("mig").join("watch")
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn read_log(git_dir: &Path, n: usize) -> Vec<Logged> {
+  let all: Vec<Logged> = std::fs::read_to_string(log_file(git_dir))
+    .map(|s| s.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+    .unwrap_or_default();
+  all[all.len().saturating_sub(n)..].to_vec()
+}
+
+fn append_log(git_dir: &Path, e: &Logged) {
+  let file = log_file(git_dir);
+  if let Some(d) = file.parent() {
+    let _ = std::fs::create_dir_all(d);
+  }
+  if std::fs::metadata(&file).is_ok_and(|m| m.len() > LOG_ROTATE_AT) {
+    let keep: Vec<String> = read_log(git_dir, LOG_KEEP)
+      .iter()
+      .filter_map(|e| serde_json::to_string(e).ok())
+      .collect();
+    let _ = std::fs::write(&file, keep.join("\n") + "\n");
+  }
+  if let (Ok(line), Ok(mut f)) = (
+    serde_json::to_string(e),
+    std::fs::OpenOptions::new().create(true).append(true).open(&file),
+  ) {
+    let _ = writeln!(f, "{line}");
+  }
+}
+
+// The watches of servers that are still alive (newest first); files of long-gone ones are removed.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn watches(git_dir: &Path) -> Vec<WatchInfo> {
+  let now = chrono::Utc::now().timestamp();
+  let mut out = Vec::new();
+  let Ok(rd) = std::fs::read_dir(watch_dir(git_dir)) else {
+    return out;
+  };
+  for e in rd.filter_map(Result::ok) {
+    let Some(w) = std::fs::read_to_string(e.path())
+      .ok()
+      .and_then(|t| serde_json::from_str::<WatchInfo>(&t).ok())
+    else {
+      continue;
+    };
+    if now - w.ts > 3600 {
+      let _ = std::fs::remove_file(e.path());
+    } else if now - w.ts <= WATCH_ALIVE_SECS {
+      out.push(w);
+    }
+  }
+  out.sort_by_key(|w| std::cmp::Reverse(w.started));
+  out
+}
+
 impl Hub {
+  // Writes (or refreshes) this server's watch file for `root`.
+  fn save_watch(&self, root: &Path) {
+    let (sub, me, webhook, started) = {
+      let g = self.lock();
+      (
+        g.subs.get(root).cloned().unwrap_or_default(),
+        g.me.get(root).cloned(),
+        g.webhooks.contains_key(root),
+        self.started_at,
+      )
+    };
+    let info = WatchInfo {
+      pid: std::process::id(),
+      agent: me,
+      started,
+      ts: chrono::Utc::now().timestamp(),
+      kinds: sub.kinds.iter().cloned().collect(),
+      paths: sub.paths.clone(),
+      include_own: sub.include_own,
+      push: sub.push,
+      every_secs: sub.every_secs,
+      webhook,
+    };
+    let dir = watch_dir(&root.join(".git"));
+    if std::fs::create_dir_all(&dir).is_ok()
+      && let Ok(t) = serde_json::to_string(&info)
+    {
+      let _ = std::fs::write(dir.join(format!("{}.json", info.pid)), t);
+    }
+  }
+
   pub fn new(notify: Notifier) -> Arc<Hub> {
     Arc::new(Hub {
+      started_at: chrono::Utc::now().timestamp(),
       inner: Mutex::new(Inner {
         next: 1,
         events: VecDeque::new(),
@@ -173,6 +305,8 @@ impl Hub {
       Some(n) => g.me.insert(root.to_path_buf(), n.to_string()),
       None => g.me.remove(root),
     };
+    drop(g);
+    self.save_watch(root);
   }
 
   pub fn note_own(&self, root: &Path) {
@@ -226,6 +360,7 @@ impl Hub {
       }
     }
     self.ensure_started(root, name);
+    self.save_watch(root);
     let mut out = format!(
       "watching {} (events are {}pushed to you as a channel when Claude Code loads mig as one; wait_events always works)",
       sub.kinds.iter().cloned().collect::<Vec<_>>().join(", "),
@@ -248,6 +383,8 @@ impl Hub {
       },
     );
     g.files_on.remove(root);
+    drop(g);
+    self.save_watch(root);
   }
 
   fn wants_files(&self, root: &Path) -> bool {
@@ -268,6 +405,7 @@ impl Hub {
     body: Option<String>,
   ) -> bool {
     let mut out: Vec<Value> = Vec::new();
+    let logged: Logged;
     {
       let mut g = self.lock();
       let sub = g.subs.get(root).cloned().unwrap_or_default();
@@ -356,11 +494,22 @@ impl Hub {
         }
         out.push(notification(&ev));
       }
+      logged = Logged {
+        id: ev.id,
+        pid: std::process::id(),
+        ts: ev.ts,
+        kind: ev.kind.clone(),
+        actor: ev.actor.clone(),
+        path: ev.path.clone(),
+        text: short(&ev.text, LOG_TEXT),
+        by: g.me.get(root).cloned(),
+      };
       g.events.push_back(ev);
       while g.events.len() > KEEP {
         g.events.pop_front();
       }
     }
+    append_log(&root.join(".git"), &logged);
     self.cv.notify_all();
     for n in out {
       (self.notify)(n);
@@ -469,6 +618,9 @@ fn poll_loop(hub: Arc<Hub>, root: PathBuf, name: String) {
   loop {
     std::thread::sleep(POLL);
     tick += 1;
+    if tick % 8 == 1 {
+      hub.save_watch(&root);
+    }
     let me = hub.lock().me.get(&root).cloned();
     for m in inbox::claim(&git, me.as_deref()) {
       let mut meta = BTreeMap::new();
