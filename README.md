@@ -462,7 +462,7 @@ AI エージェントは、Claude Code の Bash の代わりに、MCP の `run`�
 
 実行の出力は、実行中から `.git/mig/out/` のファイルに書き込みます（色コードと、上書きされる進捗行は取り除き、同じ行の連続は `(×N)` にまとめ、秘密は伏せます）。だから、実行の途中でも、エージェント（`run_output`）も人間（GUI の **Console** ページ、`mig run out -f`）も、同じログを読めます。Console では、実行を選んで、正規表現で絞り込んだり、**Stop** で止めたりできます。ファイルは新しい 40 件だけ残します。
 
-実行するときは、`*_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `ANTHROPIC_*` / `OPENAI_*` / `GITHUB_TOKEN` などの名前の環境変数を取り除きます。標準入力は空で、時間（初期値 120 秒、最大 600 秒）を超えると、プロセスごと止めます。出力は 60KB までで（先頭と末尾を残します）、シークレットは `[REDACTED]` に置き換えます。スクリプトは `.git/mig/run/` の一時ファイルに書いて、実行したら消します。
+実行するときは、`*_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `ANTHROPIC_*` / `OPENAI_*` / `GITHUB_TOKEN` などの名前の環境変数を取り除きます。標準入力は空で、時間（初期値 120 秒、最大 600 秒）を超えると、プロセスごと止めます。ただし、`background: true` で動かす実行は、時間を指定しなければ、制限なしです（学習やサーバーのように長く動くもののためです。GUI の Console の **Stop**、`mig run stop`、`run_stop` で止められます）。`timeout` を渡せば、その秒数で止まります（上限なし）。出力は 60KB までで（先頭と末尾を残します）、シークレットは `[REDACTED]` に置き換えます。スクリプトは `.git/mig/run/` の一時ファイルに書いて、実行したら消します。
 
 エージェントのセッションがあるときは、コマンドが変えたファイルも、そのエージェントが書いたものとして記録します（`agent_finish` や `agent_abort` の対象になります）。
 
@@ -473,6 +473,7 @@ AI エージェントは、Claude Code の Bash の代わりに、MCP の `run`�
 mode = "auto"                 # auto: 拒否以外は実行 / ask: 警告は人間の承認待ち / strict: 定番のコマンド以外は承認待ち
 timeout_secs = 120
 max_timeout_secs = 600
+background_timeout_secs = 0   # background: true の実行の初期の制限。0 は制限なし
 output_limit_kb = 60
 allow = ["curl https://api.example.com/*"]   # この形のコマンドは、警告を出さずに実行
 deny = ["terraform apply*"]                  # この形のコマンドは拒否

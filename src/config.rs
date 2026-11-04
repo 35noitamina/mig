@@ -34,6 +34,8 @@ pub struct RunSection {
   pub mode: RunMode,
   pub timeout_secs: u64,
   pub max_timeout_secs: u64,
+  // The time limit of a background run when none is given; 0 means no limit.
+  pub background_timeout_secs: u64,
   pub output_limit_kb: usize,
   pub approval_wait_secs: u64,
   // Command patterns (`*` matches anything) that are always fine / never allowed.
@@ -52,6 +54,7 @@ impl Default for RunSection {
       mode: RunMode::Auto,
       timeout_secs: 120,
       max_timeout_secs: 600,
+      background_timeout_secs: 0,
       output_limit_kb: 60,
       approval_wait_secs: 120,
       allow: Vec::new(),

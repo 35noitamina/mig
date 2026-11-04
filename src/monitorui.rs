@@ -177,7 +177,15 @@ impl MonitorView {
             );
             let to = e.e.by.as_deref().map(|b| format!(" → {b}")).unwrap_or_default();
             ui.label(RichText::new(format!("{}{to}", e.folder)).weak());
-            let text: String = e.e.text.lines().next().unwrap_or("").chars().take(200).collect();
+            let two: Vec<&str> = e
+              .e
+              .text
+              .lines()
+              .map(str::trim)
+              .filter(|l| !l.is_empty())
+              .take(2)
+              .collect();
+            let text: String = two.join(" · ").chars().take(200).collect();
             ui.label(RichText::new(text).monospace());
           });
         }

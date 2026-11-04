@@ -167,6 +167,8 @@ fn header(ui: &mut egui::Ui, git: &Path, m: &Meta, folder: Option<&str>, n_lines
   facts.push(format!("in {}", if m.cwd.is_empty() { "." } else { &m.cwd }));
   if m.timeout_secs > 0 {
     facts.push(format!("limit {}", dur(m.timeout_secs as f64)));
+  } else if m.kind == "argv" || m.kind == "script" {
+    facts.push("no time limit".to_string());
   }
   if let Some(c) = m.exit {
     facts.push(format!("exit code {c}"));

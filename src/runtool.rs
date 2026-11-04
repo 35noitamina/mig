@@ -39,6 +39,8 @@ pub struct Request {
   pub kind: Kind,
   pub cwd: Option<String>,
   pub timeout: Option<u64>,
+  // Runs as a job that goes on without the caller: no time limit unless one is given.
+  pub background: bool,
   pub filter: Filter,
   // Wait this long for the end; if it has not come, hand back what there is and keep running.
   pub wait_secs: Option<u64>,
@@ -152,6 +154,7 @@ pub fn parse(args: &Value, script: bool) -> Result<Request> {
     kind,
     cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
     timeout: args.get("timeout").and_then(Value::as_u64),
+    background: args.get("background").and_then(Value::as_bool).unwrap_or(false),
     filter: Filter::from_args(args)?,
     wait_secs: args.get("wait_secs").and_then(Value::as_u64),
   })
@@ -256,6 +259,9 @@ static NOTE_NO_AGENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 fn first_time(flag: &std::sync::atomic::AtomicBool) -> bool {
   !flag.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
+
+// About ten years: long enough to mean "no limit".
+const NO_LIMIT: Duration = Duration::from_secs(315_360_000);
 
 pub struct Done {
   pub text: String,
@@ -414,12 +420,21 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
     }
   };
   let (env, dropped) = runner::clean_env(&cfg, std::env::vars());
-  let timeout = Duration::from_secs(
-    req
-      .timeout
-      .unwrap_or(cfg.timeout_secs)
-      .clamp(1, cfg.max_timeout_secs.max(1)),
-  );
+  let timeout = if req.background {
+    // A job that goes on in the background (a server, a long training run) has no limit unless one
+    // is asked for; a person can stop it from the Console.
+    match req.timeout.unwrap_or(cfg.background_timeout_secs) {
+      0 => NO_LIMIT,
+      n => Duration::from_secs(n),
+    }
+  } else {
+    Duration::from_secs(
+      req
+        .timeout
+        .unwrap_or(cfg.timeout_secs)
+        .clamp(1, cfg.max_timeout_secs.max(1)),
+    )
+  };
   let info = outlog::Info {
     kind: kind_name.to_string(),
     lang: lang_text.clone(),
@@ -428,7 +443,7 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
       .strip_prefix(&root)
       .map(|p| p.display().to_string())
       .unwrap_or_default(),
-    timeout_secs: timeout.as_secs(),
+    timeout_secs: if timeout >= NO_LIMIT { 0 } else { timeout.as_secs() },
     notes: report.findings.iter().map(|f| f.show()).collect(),
   };
   Ok(Prepared {
