@@ -292,6 +292,7 @@ pub struct Prepared {
   limit: usize,
   filter: Filter,
   id: String,
+  info: outlog::Info,
   agent: Option<agent::Session>,
   _script: Option<TempScript>,
 }
@@ -419,6 +420,17 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
       .unwrap_or(cfg.timeout_secs)
       .clamp(1, cfg.max_timeout_secs.max(1)),
   );
+  let info = outlog::Info {
+    kind: kind_name.to_string(),
+    lang: lang_text.clone(),
+    code: code_text.clone(),
+    cwd: cwd
+      .strip_prefix(&root)
+      .map(|p| p.display().to_string())
+      .unwrap_or_default(),
+    timeout_secs: timeout.as_secs(),
+    notes: report.findings.iter().map(|f| f.show()).collect(),
+  };
   Ok(Prepared {
     entry,
     report,
@@ -432,6 +444,7 @@ pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) 
     limit: cfg.output_limit_kb.max(1) * 1024,
     filter: req.filter.clone(),
     id: approval::new_id(),
+    info,
     agent: agent.cloned(),
     _script,
   })
@@ -452,6 +465,7 @@ impl Prepared {
       limit,
       filter,
       id,
+      info,
       agent,
       _script,
     } = self;
@@ -460,7 +474,7 @@ impl Prepared {
     let who = agent.map(|a| a.name.clone());
     live::record(repo, "mig run", ".", who.as_deref());
     entry.out = id.clone();
-    let writer = Arc::new(outlog::create(repo.path(), &id, who.as_deref(), &entry.summary)?);
+    let writer = Arc::new(outlog::create(repo.path(), &id, who.as_deref(), &entry.summary, info)?);
     let (w2, ls2) = (writer.clone(), lines.clone());
     let sink: runner::Sink = Arc::new(move |bytes: &[u8]| {
       let got = w2.feed(bytes);
@@ -517,16 +531,19 @@ impl Prepared {
 
     let mut changed = Vec::new();
     let mut note = String::new();
+    let mut checkpoint = None;
     if let (Some(a), Some(before)) = (agent, &before) {
       changed = record_changes(repo, &root, &a.id, before);
       if !changed.is_empty() {
         if let Ok(Some(o)) = agent::checkpoint(repo, &a.id, &format!("run: {}", entry.summary)) {
           note = format!("agent {}: checkpoint {}", a.name, repo::short(o));
+          checkpoint = Some(repo::short(o).to_string());
         }
       }
     } else {
       note = "no agent session, so mig cannot undo what this changed (agent_start first)".into();
     }
+    outlog::set_changed(repo.path(), &id, &changed, checkpoint);
 
     entry.verdict = "ran".into();
     entry.exit = outcome.exit;

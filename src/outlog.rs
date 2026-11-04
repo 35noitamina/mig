@@ -13,6 +13,7 @@ use crate::{outfmt, scan};
 
 const KEEP_FILES: usize = 40;
 const MAX_BYTES: usize = 4 << 20;
+const CODE_MAX: usize = 20_000;
 
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 pub struct Meta {
@@ -28,6 +29,35 @@ pub struct Meta {
   pub cancelled: bool,
   pub secs: f64,
   pub lines: usize,
+  // What was run and how, for the detail views (all optional: older runs have none of it).
+  #[serde(default)]
+  pub kind: String,
+  #[serde(default)]
+  pub lang: Option<String>,
+  #[serde(default)]
+  pub code: String,
+  #[serde(default)]
+  pub cwd: String,
+  #[serde(default)]
+  pub timeout_secs: u64,
+  // What mig's check found (warnings and notes), as sentences.
+  #[serde(default)]
+  pub notes: Vec<String>,
+  #[serde(default)]
+  pub changed: Vec<String>,
+  #[serde(default)]
+  pub checkpoint: Option<String>,
+}
+
+// What a run is, known before it starts.
+#[derive(Default, Clone)]
+pub struct Info {
+  pub kind: String,
+  pub lang: Option<String>,
+  pub code: String,
+  pub cwd: String,
+  pub timeout_secs: u64,
+  pub notes: Vec<String>,
 }
 
 impl Meta {
@@ -130,7 +160,7 @@ struct Inner {
   full: bool,
 }
 
-pub fn create(git_dir: &Path, id: &str, agent: Option<&str>, summary: &str) -> Result<Writer> {
+pub fn create(git_dir: &Path, id: &str, agent: Option<&str>, summary: &str, info: Info) -> Result<Writer> {
   std::fs::create_dir_all(dir(git_dir))?;
   prune(git_dir);
   let meta = Meta {
@@ -139,6 +169,12 @@ pub fn create(git_dir: &Path, id: &str, agent: Option<&str>, summary: &str) -> R
     agent: agent.map(str::to_string),
     summary: summary.chars().take(200).collect(),
     state: "running".into(),
+    kind: info.kind,
+    lang: info.lang,
+    code: scan::redact(&info.code.chars().take(CODE_MAX).collect::<String>()).0,
+    cwd: info.cwd,
+    timeout_secs: info.timeout_secs,
+    notes: info.notes,
     ..Default::default()
   };
   std::fs::write(log_file(git_dir, id), b"")?;
@@ -256,6 +292,15 @@ pub fn request_stop(git_dir: &Path, id: &str) -> Result<()> {
   Ok(())
 }
 
+// Notes which files the run changed (after it ended).
+pub fn set_changed(git_dir: &Path, id: &str, changed: &[String], checkpoint: Option<String>) {
+  if let Some(mut m) = meta(git_dir, id) {
+    m.changed = changed.to_vec();
+    m.checkpoint = checkpoint;
+    write_meta(git_dir, &m);
+  }
+}
+
 pub fn stop_requested(git_dir: &Path, id: &str) -> bool {
   stop_file(git_dir, id).exists()
 }
@@ -279,7 +324,7 @@ mod tests {
   #[test]
   fn lines_are_cleaned_and_stored_while_running() {
     let git = tmp();
-    let w = create(&git, "abc123", Some("a"), "demo").unwrap();
+    let w = create(&git, "abc123", Some("a"), "demo", Info::default()).unwrap();
     w.feed(b"one\n\x1b[31mtwo\x1b[0m\nprogress 10%\rprogress 50%\rprogress 100%\nthr");
     assert_eq!(lines(&git, "abc123").unwrap(), vec!["one", "two", "progress 100%"]);
     assert!(meta(&git, "abc123").unwrap().running());
@@ -292,7 +337,7 @@ mod tests {
   #[test]
   fn secrets_are_masked_in_the_file() {
     let git = tmp();
-    let w = create(&git, "s1", None, "x").unwrap();
+    let w = create(&git, "s1", None, "x", Info::default()).unwrap();
     w.feed(format!("key ghp_{}\n", "abcdefghijklmnopqrstuvwxyz0123456789").as_bytes());
     assert!(!lines(&git, "s1").unwrap()[0].contains("ghp_abc"));
   }
@@ -300,7 +345,7 @@ mod tests {
   #[test]
   fn stop_request_is_seen_and_ids_are_checked() {
     let git = tmp();
-    let _w = create(&git, "r1", None, "x").unwrap();
+    let _w = create(&git, "r1", None, "x", Info::default()).unwrap();
     request_stop(&git, "r1").unwrap();
     assert!(stop_requested(&git, "r1"));
     assert!(lines(&git, "../x").is_err());

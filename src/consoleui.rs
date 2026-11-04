@@ -5,12 +5,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText};
-use regex::Regex;
 
 use crate::outlog::{self, Meta};
+use crate::rundetail;
 
 const REFRESH: Duration = Duration::from_millis(500);
-const SHOWN_LINES: usize = 1500;
 const LISTED: usize = 25;
 
 struct Entry {
@@ -23,11 +22,8 @@ struct Entry {
 pub struct ConsoleView {
   entries: Vec<Entry>,
   sel: Option<(PathBuf, String)>,
-  lines: Vec<String>,
-  filter: String,
-  follow: Option<bool>,
+  state: rundetail::State,
   loaded: Option<Instant>,
-  status: Option<String>,
 }
 
 fn clock(ms: i64) -> String {
@@ -63,9 +59,6 @@ impl ConsoleView {
       && let Some(e) = self.entries.first()
     {
       self.sel = Some((e.root.clone(), e.meta.id.clone()));
-    }
-    if let Some((root, id)) = &self.sel {
-      self.lines = outlog::lines(&root.join(".git"), id).unwrap_or_default();
     }
   }
 
@@ -120,71 +113,8 @@ impl ConsoleView {
     }
     egui::CentralPanel::default_margins().show(ui, |ui| {
       let Some((root, id)) = self.sel.clone() else { return };
-      let meta = self
-        .entries
-        .iter()
-        .find(|e| e.root == root && e.meta.id == id)
-        .map(|e| e.meta.clone());
-      let Some(meta) = meta else {
-        ui.label(RichText::new("That run is gone.").weak());
-        return;
-      };
-      ui.horizontal(|ui| {
-        let state = if meta.running() {
-          RichText::new("running").color(Color32::from_rgb(110, 200, 130))
-        } else {
-          RichText::new(format!("{} · {:.1}s", meta.headline(), meta.secs)).weak()
-        };
-        ui.label(state);
-        ui.label(RichText::new(format!("{} lines", self.lines.len())).weak());
-        if meta.running()
-          && ui
-            .button(RichText::new("Stop").color(Color32::from_rgb(230, 110, 110)))
-            .on_hover_text("Stop the program and everything it started")
-            .clicked()
-        {
-          self.status = Some(match outlog::request_stop(&root.join(".git"), &id) {
-            Ok(()) => "Stopping…".into(),
-            Err(e) => format!("{e:#}"),
-          });
-        }
-        let mut follow = self.follow.unwrap_or(true);
-        ui.checkbox(&mut follow, "Follow").on_hover_text("Keep the end in view");
-        self.follow = Some(follow);
-        ui.add(
-          egui::TextEdit::singleline(&mut self.filter)
-            .hint_text("filter (regular expression)")
-            .desired_width(220.0),
-        );
-        if let Some(s) = &self.status {
-          ui.label(RichText::new(s).weak());
-        }
-      });
-      ui.label(RichText::new(&meta.summary).monospace().weak());
-      ui.separator();
-      let re = (!self.filter.is_empty()).then(|| Regex::new(&self.filter)).transpose();
-      let shown: Vec<&String> = match &re {
-        Ok(Some(re)) => self.lines.iter().filter(|l| re.is_match(l)).collect(),
-        _ => self.lines.iter().collect(),
-      };
-      if re.is_err() {
-        ui.label(RichText::new("not a valid regular expression").color(Color32::from_rgb(230, 110, 110)));
-      }
-      let skip = shown.len().saturating_sub(SHOWN_LINES);
-      let mut text = String::new();
-      if skip > 0 {
-        text.push_str(&format!("… {skip} earlier lines (`mig run out {id}` has them) …\n"));
-      }
-      for l in &shown[skip..] {
-        text.push_str(l);
-        text.push('\n');
-      }
-      egui::ScrollArea::both()
-        .auto_shrink([false, false])
-        .stick_to_bottom(self.follow.unwrap_or(true))
-        .show(ui, |ui| {
-          ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
-        });
+      let folder = self.entries.iter().find(|e| e.root == root).map(|e| e.folder.clone());
+      rundetail::show(ui, &root.join(".git"), &id, &mut self.state, folder.as_deref());
     });
   }
 }

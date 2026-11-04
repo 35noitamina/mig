@@ -9,7 +9,6 @@ use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Vec2};
 
 use crate::activity::{Act, Src, Tracker};
 use crate::livewatch::{self, CONTEXT, Event, Handle, Kind, Msg, Sign};
-use crate::outlog;
 
 const KEEP_EVENTS: usize = 300;
 const GLOW: Duration = Duration::from_millis(1500);
@@ -79,6 +78,7 @@ pub struct LiveHub {
   act_polled: Option<Instant>,
   // Writes, runs, approvals, monitor.
   show: [bool; 4],
+  run_state: crate::rundetail::State,
 }
 
 fn stand_in(id: u64, a: &Act) -> Event {
@@ -200,6 +200,7 @@ impl LiveHub {
       tracker: Tracker::default(),
       act_polled: None,
       show: [true; 4],
+      run_state: Default::default(),
     }
   }
 
@@ -547,7 +548,12 @@ impl LiveHub {
     }
   }
 
-  fn act_detail(&self, ui: &mut egui::Ui, scope: Scope, folder: &str, root: &Path, at: String, act: &Act) {
+  fn act_detail(&mut self, ui: &mut egui::Ui, scope: Scope, folder: &str, root: &Path, at: String, act: &Act) {
+    if let Some(id) = &act.run {
+      let name = matches!(scope, Scope::All).then_some(folder);
+      crate::rundetail::show(ui, &root.join(".git"), id, &mut self.run_state, name);
+      return;
+    }
     ui.horizontal(|ui| {
       if matches!(scope, Scope::All) {
         ui.label(RichText::new(folder).weak());
@@ -559,31 +565,10 @@ impl LiveHub {
       ui.label(RichText::new(at).weak());
     });
     ui.add_space(4.0);
-    let mut text = act.text.clone();
-    if let Some(id) = &act.run {
-      let git = root.join(".git");
-      let lines = outlog::lines(&git, id).unwrap_or_default();
-      let running = outlog::meta(&git, id).is_some_and(|m| m.running());
-      if running {
-        ui.ctx().request_repaint_after(Duration::from_millis(500));
-        if ui
-          .button(RichText::new("Stop").color(Color32::from_rgb(230, 110, 110)))
-          .on_hover_text("Stop the program and everything it started")
-          .clicked()
-        {
-          let _ = outlog::request_stop(&git, id);
-        }
-      }
-      let skip = lines.len().saturating_sub(400);
-      text.push_str("\n\n");
-      text.push_str(&lines[skip..].join("\n"));
-    }
-    egui::ScrollArea::both()
-      .auto_shrink([false, false])
-      .stick_to_bottom(act.run.is_some())
-      .show(ui, |ui| {
-        ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
-      });
+    let text = act.text.clone();
+    egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+      ui.add(egui::Label::new(RichText::new(text).monospace()).selectable(true));
+    });
   }
 
   fn diff(&mut self, ui: &mut egui::Ui, scope: Scope) {

@@ -48,6 +48,8 @@ mod patch;
 mod repo;
 mod rev;
 mod runcheck;
+#[cfg(feature = "gui")]
+mod rundetail;
 mod runner;
 mod runtool;
 mod scan;
