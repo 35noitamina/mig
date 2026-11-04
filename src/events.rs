@@ -271,10 +271,12 @@ impl Hub {
     {
       let mut g = self.lock();
       let sub = g.subs.get(root).cloned().unwrap_or_default();
-      if !sub.kinds.contains(kind) {
+      // A job's output always goes to the agent that started it.
+      let own_kind = matches!(kind, "message" | "job");
+      if !own_kind && !sub.kinds.contains(kind) {
         return false;
       }
-      if !sub.include_own && kind != "message" && actor.is_some() && g.me.get(root) == actor.as_ref() {
+      if !sub.include_own && !own_kind && actor.is_some() && g.me.get(root) == actor.as_ref() {
         return false;
       }
       if kind == "file"
@@ -292,6 +294,7 @@ impl Hub {
       if kind == "commit" && g.own_at.get(root).is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
         return false;
       }
+      let job_done = kind == "job" && meta.get("state").is_some_and(|s| s == "done");
       let id = g.next;
       g.next += 1;
       let ev = Event {
@@ -319,7 +322,9 @@ impl Hub {
           g.file_last.insert(key, Instant::now());
         }
       }
-      if push && kind != "message" {
+      if push && job_done {
+        // The end of a job is always reported.
+      } else if push && kind != "message" {
         let window = g.pushes.entry(root.to_path_buf()).or_default();
         let now = Instant::now();
         while window
@@ -525,7 +530,7 @@ fn poll_loop(hub: Arc<Hub>, root: PathBuf, name: String) {
         let all = runtool::recent(&git, 50);
         let fresh = all
           .into_iter()
-          .filter(|e| e.ts / 1000 >= chrono::Utc::now().timestamp() - 3);
+          .filter(|e| e.ts / 1000 >= chrono::Utc::now().timestamp() - 3 && e.pid != std::process::id());
         for e in fresh {
           let who = e.agent.clone();
           let result = match (e.verdict.as_str(), e.exit, e.timed_out) {

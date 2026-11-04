@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -288,11 +288,18 @@ pub struct Params {
   pub timeout: Duration,
   pub env: HashMap<String, String>,
   pub limit: usize,
+  // Called with every piece of output as it arrives (background jobs).
+  pub sink: Option<Sink>,
+  // Set to stop the program early.
+  pub cancel: Option<Arc<AtomicBool>>,
 }
+
+pub type Sink = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 pub struct Outcome {
   pub exit: Option<i32>,
   pub timed_out: bool,
+  pub cancelled: bool,
   pub secs: f64,
   pub output: String,
 }
@@ -316,7 +323,11 @@ fn kill_tree(child: &mut std::process::Child) {
   let _ = child.kill();
 }
 
-fn pump(mut src: impl Read + Send + 'static, cap: Arc<Mutex<Capture>>) -> std::thread::JoinHandle<()> {
+fn pump(
+  mut src: impl Read + Send + 'static,
+  cap: Arc<Mutex<Capture>>,
+  sink: Option<Sink>,
+) -> std::thread::JoinHandle<()> {
   std::thread::spawn(move || {
     let mut buf = [0u8; 8192];
     while let Ok(n) = src.read(&mut buf) {
@@ -325,6 +336,9 @@ fn pump(mut src: impl Read + Send + 'static, cap: Arc<Mutex<Capture>>) -> std::t
       }
       if let Ok(mut c) = cap.lock() {
         c.push(&buf[..n]);
+      }
+      if let Some(f) = &sink {
+        f(&buf[..n]);
       }
     }
   })
@@ -357,11 +371,18 @@ pub fn execute(p: Params, mut tick: impl FnMut()) -> Result<Outcome> {
     .map_err(|e| anyhow!("could not start {}: {e}", p.program.display()))?;
   let cap = Arc::new(Mutex::new(Capture::new(p.limit)));
   let readers = [
-    child.stdout.take().map(|s| pump(s, cap.clone())),
-    child.stderr.take().map(|s| pump(s, cap.clone())),
+    child.stdout.take().map(|s| pump(s, cap.clone(), p.sink.clone())),
+    child.stderr.take().map(|s| pump(s, cap.clone(), p.sink.clone())),
   ];
   let mut last_tick = Instant::now();
+  let mut cancelled = false;
   let (status, timed_out) = loop {
+    if p.cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+      kill_tree(&mut child);
+      let _ = child.wait();
+      cancelled = true;
+      break (None, false);
+    }
     match child.try_wait()? {
       Some(s) => break (Some(s), false),
       None if started.elapsed() >= p.timeout => {
@@ -385,6 +406,7 @@ pub fn execute(p: Params, mut tick: impl FnMut()) -> Result<Outcome> {
   Ok(Outcome {
     exit: status.and_then(|s| s.code()),
     timed_out,
+    cancelled,
     secs: started.elapsed().as_secs_f64(),
     output,
   })
@@ -415,6 +437,8 @@ mod tests {
       timeout,
       env: std::env::vars().collect(),
       limit: 60_000,
+      sink: None,
+      cancel: None,
     }
   }
 
@@ -521,5 +545,26 @@ mod tests {
     };
     assert!(!path.exists());
     let _ = std::fs::remove_dir_all(dir);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn cancel_stops_the_program_and_sink_sees_output() {
+    let seen = Arc::new(Mutex::new(String::new()));
+    let (s2, c) = (seen.clone(), Arc::new(AtomicBool::new(false)));
+    let mut p = params("sh", &["-c", "echo hi; sleep 30"], Duration::from_secs(60));
+    p.sink = Some(Arc::new(move |b: &[u8]| {
+      s2.lock().unwrap().push_str(&String::from_utf8_lossy(b))
+    }));
+    p.cancel = Some(c.clone());
+    let flag = c.clone();
+    std::thread::spawn(move || {
+      std::thread::sleep(Duration::from_millis(400));
+      flag.store(true, Ordering::Relaxed);
+    });
+    let o = execute(p, || {}).unwrap();
+    assert!(o.cancelled && !o.timed_out);
+    assert!(o.secs < 10.0);
+    assert!(seen.lock().unwrap().contains("hi"));
   }
 }

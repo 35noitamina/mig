@@ -4,6 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
@@ -50,6 +52,9 @@ pub struct LogEntry {
   pub timed_out: bool,
   pub secs: f64,
   pub tail: String,
+  // The mig process that ran it, so a server can tell its own runs from other people's.
+  #[serde(default)]
+  pub pid: u32,
 }
 
 fn log_path(git_dir: &Path) -> PathBuf {
@@ -253,7 +258,33 @@ fn blocked_text(report: &Report) -> String {
   )
 }
 
+// Everything decided before the program starts: checked, approved if need be, and resolved.
+pub struct Prepared {
+  entry: LogEntry,
+  report: Report,
+  root: PathBuf,
+  cwd: PathBuf,
+  program: PathBuf,
+  args: Vec<String>,
+  env: HashMap<String, String>,
+  dropped: Vec<String>,
+  timeout: Duration,
+  limit: usize,
+  agent: Option<agent::Session>,
+  _script: Option<TempScript>,
+}
+
+impl Prepared {
+  pub fn summary(&self) -> &str {
+    &self.entry.summary
+  }
+}
+
 pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> Result<Done> {
+  prepare(repo, agent, req)?.go(repo, None, None)
+}
+
+pub fn prepare(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> Result<Prepared> {
   let root = repo
     .workdir()
     .ok_or_else(|| anyhow!("this repository has no working folder"))?
@@ -282,6 +313,7 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
     timed_out: false,
     secs: 0.0,
     tail: String::new(),
+    pid: std::process::id(),
   };
   match verdict {
     Verdict::Block => {
@@ -333,7 +365,7 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
   }
 
   // Resolve what to start.
-  let _script;
+  let mut _script = None;
   let (program, args) = match &req.kind {
     Kind::Argv(a) => (runner::find_program(&a[0], &cwd)?, a[1..].to_vec()),
     Kind::Script { lang, name, code, args } => {
@@ -342,7 +374,7 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
       let mut full = it.before.clone();
       full.push(tmp.path.to_string_lossy().into_owned());
       full.extend(args.iter().cloned());
-      _script = tmp;
+      _script = Some(tmp);
       (it.program, full)
     }
   };
@@ -353,90 +385,128 @@ pub fn run(repo: &Repository, agent: Option<&agent::Session>, req: Request) -> R
       .unwrap_or(cfg.timeout_secs)
       .clamp(1, cfg.max_timeout_secs.max(1)),
   );
-  let before = agent.map(|_| snapshot_dirty(repo, &root));
-  let who = agent.map(|a| a.name.clone());
-  live::record(repo, "mig run", ".", who.as_deref());
-  let outcome = runner::execute(
-    Params {
+  Ok(Prepared {
+    entry,
+    report,
+    root,
+    cwd,
+    program,
+    args,
+    env,
+    dropped,
+    timeout,
+    limit: cfg.output_limit_kb.max(1) * 1024,
+    agent: agent.cloned(),
+    _script,
+  })
+}
+
+impl Prepared {
+  pub fn go(self, repo: &Repository, sink: Option<runner::Sink>, cancel: Option<Arc<AtomicBool>>) -> Result<Done> {
+    let Prepared {
+      mut entry,
+      report,
+      root,
+      cwd,
       program,
       args,
-      cwd: cwd.clone(),
-      timeout,
       env,
-      limit: cfg.output_limit_kb.max(1) * 1024,
-    },
-    || live::record(repo, "mig run", ".", who.as_deref()),
-  )?;
+      dropped,
+      timeout,
+      limit,
+      agent,
+      _script,
+    } = self;
+    let agent = agent.as_ref();
+    let before = agent.map(|_| snapshot_dirty(repo, &root));
+    let who = agent.map(|a| a.name.clone());
+    live::record(repo, "mig run", ".", who.as_deref());
+    let outcome = runner::execute(
+      Params {
+        program,
+        args,
+        cwd: cwd.clone(),
+        timeout,
+        env,
+        limit,
+        sink,
+        cancel: cancel.clone(),
+      },
+      || live::record(repo, "mig run", ".", who.as_deref()),
+    )?;
 
-  let mut changed = Vec::new();
-  let mut note = String::new();
-  if let (Some(a), Some(before)) = (agent, &before) {
-    changed = record_changes(repo, &root, &a.id, before);
-    if !changed.is_empty() {
-      if let Ok(Some(o)) = agent::checkpoint(repo, &a.id, &format!("run: {}", entry.summary)) {
-        note = format!("agent {}: checkpoint {}", a.name, repo::short(o));
+    let mut changed = Vec::new();
+    let mut note = String::new();
+    if let (Some(a), Some(before)) = (agent, &before) {
+      changed = record_changes(repo, &root, &a.id, before);
+      if !changed.is_empty() {
+        if let Ok(Some(o)) = agent::checkpoint(repo, &a.id, &format!("run: {}", entry.summary)) {
+          note = format!("agent {}: checkpoint {}", a.name, repo::short(o));
+        }
+      }
+    } else {
+      note = "no agent session, so mig cannot undo what this changed (agent_start first)".into();
+    }
+
+    entry.verdict = "ran".into();
+    entry.exit = outcome.exit;
+    entry.timed_out = outcome.timed_out;
+    entry.secs = outcome.secs;
+    entry.tail = tail_of(&outcome.output);
+    append_log(repo.path(), &entry);
+
+    let head = if outcome.cancelled {
+      format!("stopped on request after {:.1}s", outcome.secs)
+    } else if outcome.timed_out {
+      format!("timed out after {}s and was stopped", timeout.as_secs())
+    } else {
+      match outcome.exit {
+        Some(c) => format!("exit {c} in {:.1}s", outcome.secs),
+        None => format!("ended by a signal after {:.1}s", outcome.secs),
+      }
+    };
+    let mut text = format!("{head}\n");
+    if outcome.output.trim().is_empty() {
+      text.push_str("(no output)\n");
+    } else {
+      text.push_str(&outcome.output);
+      if !outcome.output.ends_with('\n') {
+        text.push('\n');
       }
     }
-  } else {
-    note = "no agent session, so mig cannot undo what this changed (agent_start first)".into();
-  }
-
-  entry.verdict = "ran".into();
-  entry.exit = outcome.exit;
-  entry.timed_out = outcome.timed_out;
-  entry.secs = outcome.secs;
-  entry.tail = tail_of(&outcome.output);
-  append_log(repo.path(), &entry);
-
-  let head = if outcome.timed_out {
-    format!("timed out after {}s and was stopped", timeout.as_secs())
-  } else {
-    match outcome.exit {
-      Some(c) => format!("exit {c} in {:.1}s", outcome.secs),
-      None => format!("ended by a signal after {:.1}s", outcome.secs),
+    let notes: Vec<String> = report
+      .findings
+      .iter()
+      .filter(|f| f.level != Level::Block)
+      .map(|f| format!("- {}", f.show()))
+      .collect();
+    if !notes.is_empty() {
+      text.push_str(&format!("notes:\n{}\n", notes.join("\n")));
     }
-  };
-  let mut text = format!("{head}\n");
-  if outcome.output.trim().is_empty() {
-    text.push_str("(no output)\n");
-  } else {
-    text.push_str(&outcome.output);
-    if !outcome.output.ends_with('\n') {
+    if !dropped.is_empty() {
+      text.push_str(&format!(
+        "({} environment variable(s) that look like credentials were not passed on)\n",
+        dropped.len()
+      ));
+    }
+    if !changed.is_empty() {
+      let shown: Vec<&str> = changed.iter().take(10).map(String::as_str).collect();
+      text.push_str(&format!(
+        "changed: {}{}\n",
+        shown.join(", "),
+        if changed.len() > 10 {
+          format!(" … (+{})", changed.len() - 10)
+        } else {
+          String::new()
+        }
+      ));
+    }
+    if !note.is_empty() {
+      text.push_str(&note);
       text.push('\n');
     }
+    Ok(Done {
+      text: text.trim_end().to_string(),
+    })
   }
-  let notes: Vec<String> = report
-    .findings
-    .iter()
-    .filter(|f| f.level != Level::Block)
-    .map(|f| format!("- {}", f.show()))
-    .collect();
-  if !notes.is_empty() {
-    text.push_str(&format!("notes:\n{}\n", notes.join("\n")));
-  }
-  if !dropped.is_empty() {
-    text.push_str(&format!(
-      "({} environment variable(s) that look like credentials were not passed on)\n",
-      dropped.len()
-    ));
-  }
-  if !changed.is_empty() {
-    let shown: Vec<&str> = changed.iter().take(10).map(String::as_str).collect();
-    text.push_str(&format!(
-      "changed: {}{}\n",
-      shown.join(", "),
-      if changed.len() > 10 {
-        format!(" … (+{})", changed.len() - 10)
-      } else {
-        String::new()
-      }
-    ));
-  }
-  if !note.is_empty() {
-    text.push_str(&note);
-    text.push('\n');
-  }
-  Ok(Done {
-    text: text.trim_end().to_string(),
-  })
 }

@@ -26,6 +26,7 @@ mod gui;
 #[cfg(feature = "gui")]
 mod highlight;
 mod inbox;
+mod jobs;
 mod live;
 #[cfg(feature = "gui")]
 mod liveui;
