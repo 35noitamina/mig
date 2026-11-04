@@ -142,7 +142,7 @@ impl ApprovalsView {
               "Agents run commands on their own; mig only refuses the dangerous ones. To be asked first, set mode = \"ask\" under [run] in .mig.toml.",
             )
             .weak()
-            .small(),
+            ,
           );
         }
         let now = chrono::Utc::now().timestamp();
@@ -158,7 +158,7 @@ impl ApprovalsView {
               );
               ui.label(RichText::new(format!("{}  ·  {}", r.folder, if r.p.cwd.is_empty() { "." } else { &r.p.cwd })).weak());
               let left = (r.p.ts + r.p.wait_secs as i64 - now).max(0);
-              ui.label(RichText::new(format!("{left}s left")).weak().small());
+              ui.label(RichText::new(format!("{left}s left")).weak());
               ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                   .button(RichText::new("Deny").color(Color32::from_rgb(230, 110, 110)))
@@ -185,14 +185,14 @@ impl ApprovalsView {
             });
             for n in &r.p.notes {
               let color = if n.level == "warn" { amber } else { ui.visuals().weak_text_color() };
-              ui.label(RichText::new(format!("{}  [{}]{}", n.what, n.rule, if n.line > 0 { format!("  line {}", n.line) } else { String::new() })).color(color).small());
+              ui.label(RichText::new(format!("{}  [{}]{}", n.what, n.rule, if n.line > 0 { format!("  line {}", n.line) } else { String::new() })).color(color));
             }
             let flagged: HashSet<usize> = r.p.notes.iter().filter(|n| n.line > 0).map(|n| n.line).collect();
             let kind = match &r.p.lang {
               Some(l) => format!("{l} script"),
               None => "command".to_string(),
             };
-            ui.label(RichText::new(kind).weak().small());
+            ui.label(RichText::new(kind).weak());
             egui::ScrollArea::vertical()
               .id_salt(("code", &r.p.id))
               .max_height(220.0)
@@ -216,8 +216,8 @@ impl ApprovalsView {
             let who = r.s.agent.as_deref().unwrap_or("an agent");
             let color = if r.s.level == "attention" { Color32::from_rgb(225, 170, 80) } else { ui.visuals().text_color() };
             ui.horizontal_wrapped(|ui| {
-              ui.label(RichText::new(clock(r.s.ts)).weak().monospace().small());
-              ui.label(RichText::new(format!("{} · {who}", r.folder)).weak().small());
+              ui.label(RichText::new(clock(r.s.ts)).weak().monospace());
+              ui.label(RichText::new(format!("{} · {who}", r.folder)).weak());
               ui.label(RichText::new(&r.s.text).color(color));
             });
           }
@@ -239,14 +239,14 @@ impl ApprovalsView {
           let open = self.open_run.as_ref() == Some(&key);
           let who = r.e.agent.as_deref().unwrap_or("(you)");
           let head = ui.horizontal(|ui| {
-            ui.label(RichText::new(clock(r.e.ts / 1000)).weak().monospace().small());
-            ui.label(RichText::new(format!("{label:<12}")).color(color).monospace().small());
-            ui.label(RichText::new(format!("{} · {who}", r.folder)).weak().small());
+            ui.label(RichText::new(clock(r.e.ts / 1000)).weak().monospace());
+            ui.label(RichText::new(format!("{label:<12}")).color(color).monospace());
+            ui.label(RichText::new(format!("{} · {who}", r.folder)).weak());
             let mut s = r.e.summary.clone();
-            if s.chars().count() > 110 {
-              s = s.chars().take(110).collect::<String>() + "…";
+            if s.chars().count() > 80 {
+              s = s.chars().take(80).collect::<String>() + "…";
             }
-            ui.add(egui::Label::new(RichText::new(s).monospace().small()).sense(egui::Sense::click()))
+            ui.add(egui::Label::new(RichText::new(s).monospace()).sense(egui::Sense::click()))
           });
           if head.inner.on_hover_text("Click to show the output").clicked() {
             self.open_run = if open { None } else { Some(key) };
@@ -254,7 +254,7 @@ impl ApprovalsView {
           if open && !r.e.tail.is_empty() {
             egui::Frame::group(ui.style()).show(ui, |ui| {
               ui.set_width(ui.available_width());
-              ui.label(RichText::new(&r.e.tail).monospace().small());
+              ui.label(RichText::new(&r.e.tail).monospace());
             });
           }
         }

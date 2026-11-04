@@ -80,11 +80,7 @@ impl ConsoleView {
         ui.heading("Console");
         if self.entries.is_empty() {
           ui.label(RichText::new("No runs yet.").weak());
-          ui.label(
-            RichText::new("Runs by agents (and `mig run`) show up here while they go.")
-              .weak()
-              .small(),
-          );
+          ui.label(RichText::new("Runs by agents (and `mig run`) show up here while they go.").weak());
         }
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
           for e in &self.entries {
@@ -102,10 +98,13 @@ impl ConsoleView {
               s.push('…');
             }
             ui.horizontal(|ui| {
-              ui.label(RichText::new(mark).color(color));
+              ui.add_sized(
+                [14.0, ui.text_style_height(&egui::TextStyle::Body)],
+                egui::Label::new(RichText::new(mark).color(color)),
+              );
               let who = m.agent.as_deref().unwrap_or("you");
               let r = ui
-                .selectable_label(selected, RichText::new(s).monospace().small())
+                .selectable_label(selected, RichText::new(s).monospace())
                 .on_hover_text(format!("{} · {who} · {} · {} lines", e.folder, clock(m.ts), m.lines));
               if r.clicked() {
                 pick = Some((e.root.clone(), m.id.clone()));
@@ -137,7 +136,7 @@ impl ConsoleView {
           RichText::new(format!("{} · {:.1}s", meta.headline(), meta.secs)).weak()
         };
         ui.label(state);
-        ui.label(RichText::new(format!("{} lines", self.lines.len())).weak().small());
+        ui.label(RichText::new(format!("{} lines", self.lines.len())).weak());
         if meta.running()
           && ui
             .button(RichText::new("Stop").color(Color32::from_rgb(230, 110, 110)))
@@ -158,10 +157,10 @@ impl ConsoleView {
             .desired_width(220.0),
         );
         if let Some(s) = &self.status {
-          ui.label(RichText::new(s).weak().small());
+          ui.label(RichText::new(s).weak());
         }
       });
-      ui.label(RichText::new(&meta.summary).monospace().small().weak());
+      ui.label(RichText::new(&meta.summary).monospace().weak());
       ui.separator();
       let re = (!self.filter.is_empty()).then(|| Regex::new(&self.filter)).transpose();
       let shown: Vec<&String> = match &re {
@@ -169,11 +168,7 @@ impl ConsoleView {
         _ => self.lines.iter().collect(),
       };
       if re.is_err() {
-        ui.label(
-          RichText::new("not a valid regular expression")
-            .color(Color32::from_rgb(230, 110, 110))
-            .small(),
-        );
+        ui.label(RichText::new("not a valid regular expression").color(Color32::from_rgb(230, 110, 110)));
       }
       let skip = shown.len().saturating_sub(SHOWN_LINES);
       let mut text = String::new();
