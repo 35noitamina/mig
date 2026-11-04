@@ -51,7 +51,7 @@ fn root(repo: &Repository) -> Result<PathBuf> {
 }
 
 // A path inside the repository: no `..`, nothing under .git, and no symlink leading outside.
-fn resolve(root: &Path, input: &str) -> Result<PathBuf> {
+pub fn resolve(root: &Path, input: &str) -> Result<PathBuf> {
   let given = Path::new(input);
   let relative = if given.is_absolute() {
     given

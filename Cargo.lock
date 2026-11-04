@@ -2335,13 +2335,16 @@ dependencies = [
 name = "mig"
 version = "0.2.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "dirs",
  "eframe",
  "egui_commonmark",
  "egui_extras",
+ "epaint_default_fonts",
  "git2",
  "globset",
  "ignore",
@@ -2349,6 +2352,7 @@ dependencies = [
  "libc",
  "notify",
  "notify-rust",
+ "png",
  "regex",
  "rfd",
  "rusqlite",

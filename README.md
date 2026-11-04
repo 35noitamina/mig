@@ -160,6 +160,8 @@ AI エージェントが MCP の `run` / `run_script` で通る検査と同じ�
 | `mig run script LANG [FILE]` | スクリプトを実行（FILE がなければ標準入力）。`LANG` は `sh` `bash` `python` `node` `powershell` `cmd` `ruby` `perl` |
 | `mig run check -- CMD ARGS…` | 実行せずに、検査の結果だけ見る |
 | `mig run log [-n N]` | 最近の実行の一覧（エージェント名、結果、コマンド） |
+| `mig run out [ID] [--grep RE] [--head N] [--tail N] [-f]` | 実行の出力を読む（実行中でも読めます。`-f` は終わるまで流し続けます）。ID を省くと、最近の実行の一覧 |
+| `mig run stop ID` | 動いている実行を、プロセスごと止める |
 | `mig run pending` | 人間の承認を待っている実行の一覧（`.mig.toml` で `mode = "ask"` か `"strict"` のとき） |
 | `mig run approve ID [--always]` / `mig run deny ID` | 待っている実行を進める（`--always` は、その正確なコマンドを今後は確認なしにする）／断る |
 
@@ -259,6 +261,7 @@ AWS / GitHub / OpenAI / Anthropic / Slack / Google / Stripe のキー、秘密�
 |---|---|
 | Live — all folders | 全フォルダの書き込みを時刻順に 1 つの一覧で表示します。フォルダ名とエージェント名のバッジつきで、フォルダとエージェントで絞り込めます |
 | Approvals | 承認を待っている実行（コマンドやスクリプトの全文、見つかった理由、問題の行は色つき）に、**Run**（一度だけ実行）、**Always allow**（この正確なコマンドは今後確認しない）、**Deny** を選べます。待ちが出るとレールが琥珀色になり、デスクトップ通知も出ます。下には、全フォルダの最近の実行（拒否されたものも）が並び、クリックすると出力の末尾が見られます |
+| Console | 全フォルダの実行の出力を、実行中から流れるまま読めます（左で実行を選びます。`●` は実行中）。正規表現で絞り込み、**Follow** で末尾を追い、**Stop** で止められます |
 | Agents | 全フォルダのエージェントセッションの一覧です。開始・最終活動の時刻、書き込み数、書いたファイル（他の人がそのあと変えたものには印）を表示し、**Live**（そのエージェントの書き込みだけを見る）、**Finish…**（コミットにまとめる）、**Abort**（作業を取り消す）ができます |
 
 | 画面 | できること |
@@ -371,6 +374,7 @@ claude mcp add --scope user mig -- mig mcp     # どのプロジェクトでも
 - ファイル操作: `ls`、`read`、`read_many`、`search`、`edit`、`write`、`move`、`delete`
 
 - コマンドの実行: `run`、`run_script`、`run_check`、`run_output`、`run_stop`
+- まとめ・グラフ: `batch`、`chart`
 - 知らせ: `watch`、`unwatch`、`wait_events`、`events`、`say`
 
 `save` はシークレットや巨大ファイルがあると拒否し、`diff` と `context` の出力ではシークレットを伏せ字にします。
@@ -378,6 +382,21 @@ claude mcp add --scope user mig -- mig mcp     # どのプロジェクトでも
 ファイル操作のツールは、標準の filesystem サーバーより少ないやり取りと文字数で使えるように作ってあります。`.gitignore` に従い、行の範囲を指定して読め、中身を正規表現で検索でき、編集は完全一致の置換（複数まとめて、全部成功か全部失敗）です。常にリポジトリの中だけを対象にし、`.git` には触れません。読むときはシークレットを `[REDACTED]` に伏せ、書き込む内容にシークレットが混ざっていたら断ります。エージェントセッションの途中なら、書き込み・移動・削除のたびに自動でチェックポイントを作り、そのセッションの作業として記録するので、`agent_abort` で元に戻せます。
 
 MCP の接続 1 つが、エージェント 1 人です。`agent_start` で始めたセッションは、その接続のものになります。`agent_finish` / `agent_abort` / `checkpoint` は、`name` を省略すると自分のセッションに対して動きます。
+
+#### 少ないトークンで使う
+
+AI に返す量を減らす仕組みを、いくつか入れてあります。
+
+- **出力の絞り込み**（`run` / `run_script` / `run_output`）: `grep`（正規表現。合う行だけを行番号つきで返します）、`invert`、`grep_context`、`head`、`tail`、`quiet`（成功したら行数だけ）、`preset: "errors"`（`error` `warning` `fail` `panic` `Traceback` などの行を、前後 2 行つきで）。失敗したのに何も合わなかったときは、最後の 15 行を返します。絞り込まなくても、150 行を超える出力は先頭 40 行と末尾 110 行にします。全文は保存してあるので、`run_output` に `job`（戻り値に書いてあります）と `grep` / `from` / `to` を渡して、必要な所だけ取れます。同じコマンドをやり直す必要はありません。
+- **`wait_secs`**: 指定した秒数だけ待って、終わらなければ、そこまでの出力とジョブ番号を返して、実行は続けます。
+- **`read`**: 一度全部読んだファイルを読み直すと、変わっていなければ「変わっていない」だけ、変わっていれば差分だけを返します（`force: true` で全文）。`outline: true` は定義の行（`fn`、`class`、見出しなど）だけ、`grep` は合う行だけ、`max_chars` は返す量の上限です。
+- **`diff`** に `stat: true` を付けると、ファイル名と `+/-` の数だけ返します。
+- **`batch`**: 読む・検索する・実行するを、1 回の呼び出しにまとめます。
+- ツールの説明文は短くしてあります（定義の合計は、セッションの最初に毎回読まれるので）。
+
+#### グラフ（`chart`）
+
+数値から、折れ線か棒のグラフを PNG と SVG で作ります。PNG は画像として AI に返るので、AI は結果を見て確かめられます。最小・最大・最後・平均の値は、文字でも返します。数値は、`series`（`[{name, values}]`）、`values`、`from_run`（`[{job, pattern}]`: 実行の出力の各行から、正規表現の 1 番目のグループの数値を拾います）、`csv`（`{path, x, y}`）のどれかで渡します。できたファイルは `.git/mig/charts/` に入ります（コミットには入りません）。文字は ASCII だけ描けます（それ以外は `?`）。
 
 #### 知らせとチャンネル
 
@@ -437,6 +456,8 @@ AI エージェントは、Claude Code の Bash の代わりに、MCP の `run`�
 - **メモ**: 環境変数の一覧表示、実行時にコードを組み立てる書き方など
 
 初期値の `mode = "auto"` では、拒否以外は自動で実行します。`mode = "ask"` にすると、警告が出た実行は、人間が承認するまで待ちます（GUI の **Approvals**、または `mig run approve`）。エージェントの呼び出しは、`approval_wait_secs`（初期値 120 秒）まで待って、答えがなければ「実行しなかった」と返します。`mode = "strict"` は、`cargo test` や `git status` のような定番のコマンド以外を、すべて承認待ちにします。「Always allow」で覚えた実行は `.git/mig/run-allow.json` に入ります。
+
+実行の出力は、実行中から `.git/mig/out/` のファイルに書き込みます（色コードと、上書きされる進捗行は取り除き、同じ行の連続は `(×N)` にまとめ、秘密は伏せます）。だから、実行の途中でも、エージェント（`run_output`）も人間（GUI の **Console** ページ、`mig run out -f`）も、同じログを読めます。Console では、実行を選んで、正規表現で絞り込んだり、**Stop** で止めたりできます。ファイルは新しい 40 件だけ残します。
 
 実行するときは、`*_KEY` / `*_TOKEN` / `*_SECRET` / `*PASSWORD*` / `AWS_*` / `ANTHROPIC_*` / `OPENAI_*` / `GITHUB_TOKEN` などの名前の環境変数を取り除きます。標準入力は空で、時間（初期値 120 秒、最大 600 秒）を超えると、プロセスごと止めます。出力は 60KB までで（先頭と末尾を残します）、シークレットは `[REDACTED]` に置き換えます。スクリプトは `.git/mig/run/` の一時ファイルに書いて、実行したら消します。
 
@@ -588,7 +609,7 @@ mig diff    通常の unified diff
 |---|---|---|
 | `repos` | なし | 操作できるフォルダの一覧（名前・パス・ブランチ・動いているエージェント、既定のフォルダには `[default]`） |
 | `status` | なし | ブランチ、変更ファイル（`記号 パス`）、すべてのエージェントセッション（自分のものには `(you)`） |
-| `diff` | `rev`（省略時は未保存の変更） | unified diff（シークレットは `[REDACTED]`、長すぎる場合は途中で切る） |
+| `diff` | `rev`（省略時は未保存の変更）、`stat` | unified diff（シークレットは `[REDACTED]`、長すぎる場合は途中で切る） |
 | `log` | `count`（1〜200、既定 20） | `番号 短縮ハッシュ 件名` の行 |
 | `context` | `diff`（真偽値）、`files`（パスの配列） | Markdown の概要（シークレットは `[REDACTED]`） |
 | `save` | **`message`** | `saved <ハッシュ>`。シークレットや巨大ファイルがあると、場所つきのエラーで拒否します。他のエージェントと同時のセッションでは、自分が書いたファイルだけをコミットします |
@@ -597,9 +618,11 @@ mig diff    通常の unified diff
 | `agent_start` | `name` | セッションの開始メッセージ。他のエージェントがいれば、その名前 |
 | `checkpoint` | `message`、`name` | `checkpoint <ハッシュ>`、または変更が無い旨 |
 | `agent_finish` | **`message`**、`name` | 終了メッセージと新しい HEAD。コミットしなかった他の人の変更があれば、その数 |
-| `run` | **`argv`**（プログラムと引数のリスト）、`cwd`、`timeout`、`background` | `exit 0 in 3.2s` と出力（先頭と末尾、シークレットは伏せ字）、警告、変わったファイル、チェックポイント。拒否されたときは `isError` で理由 |
-| `run_script` | **`lang`**、**`code`**、`args`、`cwd`、`timeout`、`background` | `run` と同じ。コードは一時ファイルに書いて実行し、消します |
-| `run_output` | `job`、`since` | 背景のジョブの出力（`since` から）と状態。`job` を省略するとジョブの一覧 |
+| `run` | **`argv`**（プログラムと引数のリスト）、`cwd`、`timeout`、`background`、`wait_secs`、`grep`、`invert`、`grep_context`、`head`、`tail`、`quiet`、`preset` | `exit 0 in 3.2s` と出力（先頭と末尾、シークレットは伏せ字）、警告、変わったファイル、チェックポイント。拒否されたときは `isError` で理由 |
+| `run_script` | **`lang`**、**`code`**、`args`、`cwd`、`timeout`、`background`、`wait_secs`、`grep`、`invert`、`grep_context`、`head`、`tail`、`quiet`、`preset` | `run` と同じ。コードは一時ファイルに書いて実行し、消します |
+| `run_output` | `job`、`since`、`from`、`to`、`grep`、`invert`、`grep_context`、`head`、`tail` | 実行の保存済みの出力（実行中でも）と状態。`job` を省略すると、最近の実行の一覧 |
+| `batch` | **`calls`**（`{tool, args}` の配列）、`stop_on_error` | 順に実行して、`## 番号 ツール名` の見出しつきで返す（`batch` と `wait_events` は入れられません） |
+| `chart` | `type`、`title`、`series` / `values` / `from_run` / `csv`、`x_labels`、`width`、`height`、`name` | 保存先、各系列の n・min・max・last・mean、PNG（画像） |
 | `run_stop` | **`job`** | 背景のジョブを、プロセスごと止める |
 | `watch` | `kinds`、`paths`、`include_own`、`push`、`quiet_secs`、`every_secs`、`webhook` | 何を知らせるかを決めた結果（Webhook の URL を含む） |
 | `unwatch` | なし | 知らせを止める |
@@ -609,7 +632,7 @@ mig diff    通常の unified diff
 | `run_check` | `argv`、または `lang` と `code` | 実行せずに、実行される / 承認待ち / 拒否の判定と、見つかった理由 |
 | `agent_abort` | `name` | 終了メッセージ、元に戻したファイルの数、捨てた作業の保存先。他の人があとから変えたため戻さなかったファイルがあれば、その一覧 |
 | `ls` | `path`（既定 `.`）、`depth`（1〜6、既定 1） | `.gitignore` を除いた一覧。ファイルはサイズと変更記号（`M` / `A` / `?`）つき |
-| `read` | **`path`**、`from`、`to` | 見出し1行（行数・サイズ・範囲）と、行番号つきの本文。既定は 400 行まで（上限 2000）。続きがあれば `from=` の案内が付く。バイナリと 8MB 超は本文なし。シークレットは `[REDACTED]` |
+| `read` | **`path`**、`from`、`to`、`outline`、`grep`、`context`、`max_chars`、`force` | 見出し1行（行数・サイズ・範囲）と、行番号つきの本文。既定は 400 行まで（上限 2000）。続きがあれば `from=` の案内が付く。バイナリと 8MB 超は本文なし。シークレットは `[REDACTED]` |
 | `read_many` | **`files`**（パス、または `{path, from, to}` の配列） | `read` をまとめた結果。失敗したファイルがあっても他は読む |
 | `search` | **`pattern`**（正規表現）、`path`、`glob`、`context`（0〜5）、`max`（既定 50）、`ignore_case` | `パス:行:本文`（前後の行は `パス-行-本文`）。2MB 超とバイナリは対象外 |
 | `edit` | **`path`**、**`edits`**（`{old, new, all}` の配列）、`dry_run` | 小さい unified diff。`old` は 1 回だけ一致する必要があり、複数あれば行番号を出して断る。シークレットらしい `new` は拒否 |
@@ -629,6 +652,8 @@ mig diff    通常の unified diff
 | `.git/mig/agents/<名前>.json` | 進行中のエージェントセッション（書いたファイルと、その前後の内容の ID） |
 | `.git/mig/run.jsonl` | `run` / `run_script` の記録（時刻、エージェント、コマンド、判定、終了コード、出力の末尾）。最大 500 件 |
 | `.git/mig/run/` | 実行中の一時スクリプトと、承認待ち（`pending/`）。終わると消えます |
+| `.git/mig/out/` | 実行の出力（`ID.log`）と状態（`ID.json`）。実行中から書かれ、新しい 40 件だけ残します。`ID.stop` は「止めて」の合図 |
+| `.git/mig/charts/` | `chart` が作った PNG / SVG（新しい 60 件まで） |
 | `.git/mig/inbox/` / `outbox/` | 人間から AI へのメモ（`mig tell`、GUI）と、AI から人間へのメモ（`say`）。1 件 1 ファイルで、1 日たつと消えます |
 | `.git/mig/lock.json` | `mig lock` が Claude Code の設定に足した項目（`unlock` で、これだけを消すため） |
 | `.git/mig/run-allow.json` | 「Always allow」で覚えた実行（正確なコマンドの指紋） |
@@ -676,6 +701,7 @@ cargo fmt && cargo clippy
 | `config.rs` | `.mig.toml` と、プロジェクトの種類の判定 |
 | `ai.rs` / `assist.rs` | 提供元ごとの API 呼び出し、コミットメッセージ・説明・レビュー・tidy・context |
 | `agent.rs` / `mcp.rs` / `files.rs` / `live.rs` / `workspace.rs` / `runcheck.rs` / `runner.rs` / `runtool.rs` / `approval.rs` / `lock.rs` | エージェントセッション（複数同時）、MCP サーバー、MCP のファイル操作、その操作のログ、開いているフォルダの一覧、コマンドの検査、実行、記録 |
+| `outfmt.rs` / `outlog.rs` / `chart.rs` / `consoleui.rs` | 出力の整形と絞り込み、出力の保存、グラフの描画、Console ページ |
 | `events.rs` / `inbox.rs` / `jobs.rs` / `tellui.rs` | 知らせ（`wait_events`・チャンネル・Webhook・タイマー）、人間と AI のメモ、背景のジョブ、「Send to Claude」のダイアログ |
 | `gui.rs` / `editor.rs` / `viewer.rs` / `welcome.rs` / `settings.rs` / `aiui.rs` / `sizeui.rs` / `livewatch.rs` / `liveui.rs` / `agentsui.rs` / `highlight.rs` / `finder.rs` / `approvalsui.rs` | GUI（画面全体とフォルダの切り替え、エディタ、ビュワー、ようこそ画面、設定、AI まわり、サイズのグラフ、ファイル監視と差分、Live、Agents、色付け、検索） |
 

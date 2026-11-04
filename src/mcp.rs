@@ -209,6 +209,23 @@ fn tools() -> Vec<Value> {
       &["calls"],
     ),
     tool(
+      "chart",
+      "Draw a line or bar chart as PNG (returned to you as an image) and SVG. Numbers: series [{name, values}], values [...], from_run [{job, pattern}] (regex group 1 = a number per matching output line), or csv {path, x, y}. Saved under .git/mig/charts/; min/max/last/mean come back as text.",
+      json!({
+        "type": {"type": "string", "enum": ["line", "bar"]},
+        "title": {"type": "string"},
+        "series": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}, "values": {"type": "array", "items": {"type": "number"}}}}},
+        "values": {"type": "array", "items": {"type": "number"}},
+        "x_labels": {"type": "array", "items": {"type": "string"}},
+        "from_run": {"type": "array", "items": {"type": "object", "properties": {"job": {"type": "string"}, "pattern": {"type": "string"}, "name": {"type": "string"}}}},
+        "csv": {"type": "object", "properties": {"path": {"type": "string"}, "x": {"type": "string"}, "y": {"type": "array", "items": {"type": "string"}}}},
+        "width": {"type": "integer"},
+        "height": {"type": "integer"},
+        "name": {"type": "string", "description": "File name (default: a time stamp)"}
+      }),
+      &[],
+    ),
+    tool(
       "watch",
       "Choose which news to receive. kinds: message, agent, run, commit (default) plus file, timer, webhook. Pushed as a channel when Claude Code loads mig as one; wait_events always works.",
       json!({
@@ -261,7 +278,7 @@ fn tools() -> Vec<Value> {
     tool(
       "diff",
       "Diff of uncommitted changes, or of one commit when `rev` is given (a `log` number such as \"1\", or a commit id). Secrets are redacted.",
-      json!({"rev": {"type": "string"}}),
+      json!({"rev": {"type": "string"}, "stat": {"type": "boolean", "description": "Only file names with +/- counts"}}),
       &[],
     ),
     tool(
@@ -448,6 +465,26 @@ fn run_tool(repo: &Repository, name: &str, args: &Value, rc: &mut RepoConn) -> R
           repo.diff_tree_to_workdir_with_index(head.as_ref(), Some(&mut o))?
         }
       };
+      if args.get("stat").and_then(Value::as_bool).unwrap_or(false) {
+        let mut rows = Vec::new();
+        for i in 0..d.deltas().len() {
+          if let Some(p) = git2::Patch::from_diff(&d, i)? {
+            let (_, add, del) = p.line_stats()?;
+            let path = p
+              .delta()
+              .new_file()
+              .path()
+              .map(|x| x.display().to_string())
+              .unwrap_or_default();
+            rows.push(format!("{path} +{add} -{del}"));
+          }
+        }
+        return Ok(if rows.is_empty() {
+          "no changes".into()
+        } else {
+          rows.join("\n")
+        });
+      }
       let (d, _) = ai::clip(&crate::cli::render_diff(&d, false)?, MAX_DIFF);
       let (d, _) = scan::redact(&d);
       Ok(if d.trim().is_empty() { "no changes".into() } else { d })
@@ -599,6 +636,11 @@ fn negotiate(requested: Option<&str>) -> &'static str {
 }
 
 static OUT: Mutex<()> = Mutex::new(());
+
+thread_local! {
+  // Pictures made by the call being handled on this thread; they go out with its reply.
+  static IMAGES: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 // One line of JSON on stdout; calls from several threads do not interleave.
 fn emit(v: &Value) {
@@ -792,6 +834,11 @@ impl Server {
         }
         Ok(runtool::run(repo, agent.as_ref(), req)?.text)
       }
+      "chart" => {
+        let made = crate::chart::make(root, &git, args)?;
+        IMAGES.with(|i| i.borrow_mut().push(made.png));
+        Ok(made.text)
+      }
       "run_output" => match args.get("job").and_then(Value::as_str) {
         Some(id) => jobs::output(
           &git,
@@ -899,8 +946,14 @@ impl Server {
       "tools/call" => {
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
+        IMAGES.with(|i| i.borrow_mut().clear());
         let (text, is_error) = self.call(name, &args);
-        Ok(json!({"content": [{"type": "text", "text": text}], "isError": is_error}))
+        let mut content = vec![json!({"type": "text", "text": text})];
+        for png in IMAGES.with(|i| std::mem::take(&mut *i.borrow_mut())) {
+          use base64::Engine;
+          content.push(json!({"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(png), "mimeType": "image/png"}));
+        }
+        Ok(json!({"content": content, "isError": is_error}))
       }
       _ => Err((-32601, format!("method not found: {method}"))),
     }

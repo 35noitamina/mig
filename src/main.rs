@@ -9,6 +9,7 @@ mod approval;
 #[cfg(feature = "gui")]
 mod approvalsui;
 mod assist;
+mod chart;
 mod cli;
 mod config;
 #[cfg(feature = "gui")]
